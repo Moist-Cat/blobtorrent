@@ -14,6 +14,8 @@ import time
 import urllib.parse
 import requests
 from typing import Any, Dict, List, Tuple
+from pathlib import Path
+from collections import OrderedDict
 
 # Set up logging with more detailed format
 logging.basicConfig(
@@ -111,6 +113,37 @@ class BencodeEncoder:
             logger.error(f"Error in BencodeEncoder.encode: {e}")
             raise
 
+class FileCache:
+    def __init__(self, max_files: int = 512):
+        self.max_files = max_files
+        self.cache = OrderedDict()
+        self.lock = threading.Lock()
+        
+    def get_file(self, filepath: Path):
+        with self.lock:
+            if filepath in self.cache:
+                # Move to end to mark as recently used
+                self.cache.move_to_end(filepath)
+                return self.cache[filepath]
+            else:
+                # If cache is full, remove least recently used
+                if len(self.cache) >= self.max_files:
+                    oldest_path, oldest_file = self.cache.popitem(last=False)
+                    oldest_file.close()
+                
+                # Open new file and add to cache
+                file_obj = open(filepath, "r+b")
+                self.cache[filepath] = file_obj
+                return file_obj
+                
+    def close_all(self):
+        with self.lock:
+            for file_obj in self.cache.values():
+                file_obj.close()
+            self.cache.clear()
+            
+    def __del__(self):
+        self.close_all()
 
 class TorrentFile:
     def __init__(self, filepath: str):
@@ -394,21 +427,190 @@ class PieceManager:
         self.torrent = torrent
         self.pieces = [None] * torrent.num_pieces
         self.downloaded_pieces = [False] * torrent.num_pieces
+        self.downloading_pieces = [False] * torrent.num_pieces
         self.piece_availability = [0] * torrent.num_pieces
         self.lock = threading.Lock()
-        self.output_dir = output_dir
+        self.output_dir = Path(output_dir)
+        self.file_cache = FileCache(max_files=512)
+
+        # Initialize file structure and check for existing data
+        self.file_offsets = self._initialize_files()
+
+        # Track file completion status for stochastic selection
+        self.file_progress = {i: 0 for i in range(len(self.file_offsets))}
+        self.piece_to_file = self._map_pieces_to_files()
+
+        # Verify existing pieces
+        self._verify_existing_pieces()
+
+        logger.info(f"Initialized {len(self.file_offsets)} files")
+        logger.info(f"Already downloaded: {sum(self.downloaded_pieces)}/{self.torrent.num_pieces} pieces")
+
+    def _initialize_files(self):
+        file_offsets = []
+        current_offset = 0
+
+        if b"files" in self.torrent.info:
+            # Multi-file torrent
+            root_path = self.output_dir / self.torrent.info[b"name"].decode()
+            root_path.mkdir(parents=True, exist_ok=True)
+
+            for file_info in self.torrent.info[b"files"]:
+                file_path = root_path / Path(*[p.decode() for p in file_info[b"path"]])
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+
+                file_size = file_info[b"length"]
+                file_offsets.append({
+                    "path": file_path,
+                    "offset": current_offset,
+                    "length": file_size,
+                    "completed": False
+                })
+
+                # Check if file exists and has correct size
+                if file_path.exists() and file_path.stat().st_size == file_size:
+                    logger.info(f"File already exists: {file_path}")
+                else:
+                    # Create or truncate file to correct size
+                    with open(file_path, "wb") as f:
+                        f.truncate(file_size)
+                    logger.info(f"Created file: {file_path}")
+
+                current_offset += file_size
+        else:
+            # Single-file torrent
+            file_path = self.output_dir / self.torrent.info[b"name"].decode()
+            file_size = self.torrent.info[b"length"]
+
+            file_offsets.append({
+                "path": file_path,
+                "offset": 0,
+                "length": file_size,
+                "completed": False
+            })
+
+            # Check if file exists and has correct size
+            if file_path.exists() and file_path.stat().st_size == file_size:
+                logger.info(f"File already exists: {file_path}")
+            else:
+                # Create or truncate file to correct size
+                with open(file_path, "wb") as f:
+                    f.truncate(file_size)
+                logger.info(f"Created file: {file_path}")
+
+        return file_offsets
+
+    def _verify_existing_pieces(self):
+        """Check existing files for already downloaded pieces"""
+        logger.info("Verifying existing pieces...")
         
-        output_filename = os.path.join(output_dir, torrent.info[b"name"].decode())
-        logger.info(f"Creating output file: {output_filename}")
+        for piece_index in range(self.torrent.num_pieces):
+            # Read piece data from files
+            piece_data = self._read_piece_from_files(piece_index)
+            if piece_data is None:
+                continue  # Piece doesn't exist or error reading
+                
+            # Verify piece hash
+            expected_hash = self.torrent.piece_hashes[piece_index]
+            actual_hash = hashlib.sha1(piece_data).digest()
+            
+            if expected_hash == actual_hash:
+                self.downloaded_pieces[piece_index] = True
+                logger.debug(f"Verified existing piece {piece_index}")
+                
+                # Update file progress
+                piece_start = piece_index * self.torrent.piece_length
+                piece_end = min(piece_start + len(piece_data), self.torrent.total_size)
+                self._update_file_progress(piece_start, piece_end)
+            else:
+                logger.warning(f"Corrupted piece {piece_index} found, will redownload")
+                
+        logger.info(f"Verification complete. Found {sum(self.downloaded_pieces)} valid pieces")
+
+    def _read_piece_from_files(self, piece_index: int) -> bytes:
+        """Read a piece from existing files"""
+        piece_start = piece_index * self.torrent.piece_length
+        piece_length = self.torrent.piece_length
+        
+        # Handle last piece which might be shorter
+        if piece_index == self.torrent.num_pieces - 1:
+            piece_length = self.torrent.total_size - piece_start
+            
+        data = b""
+        current_offset = piece_start
         
         try:
-            os.makedirs(output_dir, exist_ok=True)
-            self.file = open(output_filename, "wb")
-            self.file.truncate(torrent.total_size)
-            logger.info(f"Output file initialized with size {torrent.total_size} bytes")
+            while len(data) < piece_length:
+                # Find the file that contains current_offset
+                file_info = None
+                for f in self.file_offsets:
+                    if f["offset"] <= current_offset < f["offset"] + f["length"]:
+                        file_info = f
+                        break
+                
+                if file_info is None:
+                    break  # Should not happen if torrent metadata is correct
+                
+                # Calculate how much to read from this file
+                file_read_start = current_offset - file_info["offset"]
+                file_read_end = min(file_info["length"], file_read_start + (piece_length - len(data)))
+                bytes_to_read = file_read_end - file_read_start
+                
+                # Read from file
+                file_obj = self.file_cache.get_file(file_info["path"])
+                file_obj.seek(file_read_start)
+                chunk = file_obj.read(bytes_to_read)
+                
+                if not chunk:
+                    break  # EOF or error
+                    
+                data += chunk
+                current_offset += len(chunk)
+                
+            return data if len(data) == piece_length else None
+            
         except Exception as e:
-            logger.error(f"Failed to initialize output file: {e}")
-            raise
+            logger.error(f"Error reading piece {piece_index}: {e}")
+            return None
+
+    def _update_file_progress(self, start_offset: int, end_offset: int):
+        """Update progress tracking for files affected by a piece"""
+        for file_idx, file_info in enumerate(self.file_offsets):
+            file_start = file_info["offset"]
+            file_end = file_info["offset"] + file_info["length"]
+            
+            # Check if piece overlaps with this file
+            if start_offset < file_end and end_offset > file_start:
+                # Calculate overlap
+                overlap_start = max(start_offset, file_start)
+                overlap_end = min(end_offset, file_end)
+                bytes_in_file = overlap_end - overlap_start
+                
+                self.file_progress[file_idx] += bytes_in_file
+
+    def _map_pieces_to_files(self):
+        """Map each piece to the files it affects"""
+        piece_to_file = {}
+
+        for piece_index in range(self.torrent.num_pieces):
+            piece_start = piece_index * self.torrent.piece_length
+            piece_end = piece_start + min(
+                self.torrent.piece_length,
+                self.torrent.total_size - piece_start
+            )
+
+            affected_files = []
+            for file_idx, file_info in enumerate(self.file_offsets):
+                file_start = file_info["offset"]
+                file_end = file_info["offset"] + file_info["length"]
+
+                # Check if piece overlaps with this file
+                if piece_start < file_end and piece_end > file_start:
+                    affected_files.append(file_idx)
+
+            piece_to_file[piece_index] = affected_files
+
+        return piece_to_file
 
     def update_availability(self, bitfield: bytes):
         with self.lock:
@@ -423,65 +625,129 @@ class PieceManager:
                     self.piece_availability[i] += 1
             logger.debug(f"Piece availability updated. Available pieces: {sum(1 for x in self.piece_availability if x > 0)}/{self.torrent.num_pieces}")
 
+    def mark_downloading(self, piece_index: int) -> bool:
+        """Mark a piece as being downloaded. Returns True if successful, False if already downloading."""
+        with self.lock:
+            if self.downloading_pieces[piece_index] or self.downloaded_pieces[piece_index]:
+                return False
+            self.downloading_pieces[piece_index] = True
+            logger.debug(f"Marked piece {piece_index} as downloading")
+            return True
+
+    def unmark_downloading(self, piece_index: int):
+        """Unmark a piece that is no longer being downloaded."""
+        with self.lock:
+            self.downloading_pieces[piece_index] = False
+            logger.debug(f"Unmarked piece {piece_index} as downloading")
+
     def get_rarest_piece(self) -> int:
+        """Stochastic piece selection based on rarity and file completion"""
         with self.lock:
             available_pieces = [
                 i
                 for i in range(self.torrent.num_pieces)
-                if not self.downloaded_pieces[i] and self.piece_availability[i] > 0
+                if not self.downloaded_pieces[i] and not self.downloading_pieces[i] and self.piece_availability[i] > 0
             ]
+
             if not available_pieces:
                 logger.debug("No available pieces to download")
                 return -1
-            rarest = min(available_pieces, key=lambda i: self.piece_availability[i])
-            logger.debug(f"Selected rarest piece: {rarest} (availability: {self.piece_availability[rarest]})")
-            return rarest
 
-    def mark_downloading(self, piece_index: int):
-        with self.lock:
-            logger.debug(f"Marking piece {piece_index} as downloading")
+            # Calculate weights for each piece
+            weights = []
+            for piece_index in available_pieces:
+                # Base weight: inverse of availability (rarer pieces have higher weight)
+                if self.piece_availability[piece_index] == 0:
+                    # Too rare!
+                    weights.append(0)
+                rarity_weight = 1.0 / (self.piece_availability[piece_index])
+
+                # File completion bonus: pieces from less completed files get higher weight
+                file_bonus = 0
+                for file_idx in self.piece_to_file[piece_index]:
+                    file_completion = self.file_progress[file_idx] / self.file_offsets[file_idx]["length"]
+                    file_bonus += (1 - file_completion)  # Higher bonus for less complete files
+
+                # Combine weights
+                weight = rarity_weight * (1 + file_bonus)
+                weights.append(weight)
+
+            # Normalize weights to probabilities
+            total_weight = sum(weights)
+            if total_weight == 0:
+                # We don't have anything!?
+                # Fallback to uniform distribution if all weights are zero
+                weights = [1] * len(weights)
+                total_weight = len(weights)
+
+            probabilities = [w / total_weight for w in weights]
+
+            # Select a piece based on probabilities
+            selected_index = random.choices(available_pieces, weights=probabilities, k=1)[0]
+            logger.debug(f"Selected piece {selected_index} using stochastic selection")
+            return selected_index
 
     def save_piece(self, piece_index: int, data: bytes):
         with self.lock:
             if self.downloaded_pieces[piece_index]:
                 logger.warning(f"Piece {piece_index} already downloaded, skipping")
                 return
-            
-            logger.info(f"Verifying piece {piece_index} (size: {len(data)} bytes)")
+
+            # Verify piece hash
             expected_hash = self.torrent.piece_hashes[piece_index]
             actual_hash = hashlib.sha1(data).digest()
-            
+
             if expected_hash != actual_hash:
                 logger.error(f"Piece {piece_index} hash mismatch! Expected: {binascii.hexlify(expected_hash).decode()}, Got: {binascii.hexlify(actual_hash).decode()}")
                 return
-            
-            try:
-                offset = piece_index * self.torrent.piece_length
-                self.file.seek(offset)
-                self.file.write(data)
-                self.file.flush()
-                self.downloaded_pieces[piece_index] = True
-                
-                downloaded_count = sum(self.downloaded_pieces)
-                progress = (downloaded_count / self.torrent.num_pieces) * 100
-                logger.info(f"Piece {piece_index} downloaded and verified successfully. Progress: {progress:.1f}% ({downloaded_count}/{self.torrent.num_pieces} pieces)")
-            except Exception as e:
-                logger.error(f"Failed to save piece {piece_index}: {e}")
+
+            # Calculate piece boundaries
+            piece_start = piece_index * self.torrent.piece_length
+            piece_end = piece_start + len(data)
+
+            # Write to affected files
+            for file_info in self.file_offsets:
+                file_start = file_info["offset"]
+                file_end = file_info["offset"] + file_info["length"]
+
+                # Check if piece overlaps with this file
+                if piece_start < file_end and piece_end > file_start:
+                    # Calculate overlap boundaries
+                    write_start = max(piece_start, file_start)
+                    write_end = min(piece_end, file_end)
+
+                    # Calculate file-specific offset and data slice
+                    file_offset = write_start - file_start
+                    data_start = write_start - piece_start
+                    data_end = data_start + (write_end - write_start)
+
+                    # Write to file using cache
+                    file_obj = self.file_cache.get_file(file_info["path"])
+                    file_obj.seek(file_offset)
+                    file_obj.write(data[data_start:data_end])
+
+                    # Update file progress
+                    bytes_written = write_end - write_start
+                    self.file_progress[self.file_offsets.index(file_info)] += bytes_written
+
+            self.downloaded_pieces[piece_index] = True
+            self.downloading_pieces[piece_index] = False
+
+            downloaded_count = sum(self.downloaded_pieces)
+            progress = (downloaded_count / self.torrent.num_pieces) * 100
+            logger.info(f"Piece {piece_index} downloaded and verified successfully. Progress: {progress:.1f}% ({downloaded_count}/{self.torrent.num_pieces} pieces)")
 
     def is_complete(self) -> bool:
         with self.lock:
             complete = all(self.downloaded_pieces)
             if complete:
                 logger.info("All pieces downloaded successfully!")
+                self.file_cache.close_all()
         return complete
 
     def close(self):
-        try:
-            self.file.close()
-            logger.info("Output file closed successfully")
-        except Exception as e:
-            logger.error(f"Error closing output file: {e}")
-
+        self.file_cache.close_all()
+        logger.info("All files closed successfully")
 
 class PeerDownloader(threading.Thread):
     def __init__(
@@ -500,6 +766,7 @@ class PeerDownloader(threading.Thread):
         self.unchoked = False
         self.bitfield = None
         self.daemon = True
+        self.current_piece = None
         logger.info(f"PeerDownloader initialized for {peer}")
 
     def run(self):
@@ -517,31 +784,71 @@ class PeerDownloader(threading.Thread):
             self.piece_manager.update_availability(self.bitfield)
             self.protocol.send_interested()
 
-
-            # unchoke
-            self._receive_bitfield()
+            # Wait for unchoke
+            self._wait_for_unchoke()
             
             logger.info(f"Starting download loop with {self.peer}")
             while not self.piece_manager.is_complete():
                 if not self.unchoked:
-                    self._receive_bitfield()
-                    logger.debug(f"Waiting for unchoke from {self.peer}")
-                    time.sleep(1)
+                    self._wait_for_unchoke()
                     continue
                 
+                # Get a piece to download
                 piece_index = self.piece_manager.get_rarest_piece()
                 if piece_index == -1:
                     logger.info(f"No more pieces to download from {self.peer}")
                     break
                 
+                # Try to reserve the piece
+                if not self.piece_manager.mark_downloading(piece_index):
+                    logger.debug(f"Piece {piece_index} already being downloaded, trying another")
+                    time.sleep(0.1)
+                    continue
+                
+                self.current_piece = piece_index
                 logger.info(f"Downloading piece {piece_index} from {self.peer}")
-                self._download_piece(piece_index)
+                
+                # Download the piece
+                success = self._download_piece(piece_index)
+                
+                # Unreserve the piece if download failed
+                if not success:
+                    self.piece_manager.unmark_downloading(piece_index)
+                    self.current_piece = None
                 
         except Exception as e:
             logger.error(f"Error in downloader for {self.peer}: {e}")
+            if self.current_piece is not None:
+                self.piece_manager.unmark_downloading(self.current_piece)
         finally:
             self.protocol.close()
             logger.info(f"Downloader for {self.peer} finished")
+
+    def _wait_for_unchoke(self):
+        """Wait for unchoke message with timeout"""
+        start_time = time.time()
+        while time.time() - start_time < 30:  # 30 second timeout
+            msg_id, payload = self.protocol.receive_message()
+            if msg_id is None:
+                time.sleep(0.1)
+                continue
+                
+            if msg_id == PeerWireProtocol.UNCHOKE:
+                self.unchoked = True
+                logger.info(f"Received UNCHOKE from {self.peer}")
+                return
+            elif msg_id == PeerWireProtocol.CHOKE:
+                self.unchoked = False
+                logger.info(f"Received CHOKE from {self.peer}")
+            elif msg_id == PeerWireProtocol.HAVE:
+                piece_index = struct.unpack(">I", payload)[0]
+                logger.debug(f"Received HAVE for piece {piece_index}")
+                # Update availability for this piece
+                with self.piece_manager.lock:
+                    if piece_index < len(self.piece_manager.piece_availability):
+                        self.piece_manager.piece_availability[piece_index] += 1
+        
+        logger.warning(f"Timeout waiting for unchoke from {self.peer}")
 
     def _receive_bitfield(self):
         logger.info(f"Waiting for bitfield from {self.peer}")
@@ -563,11 +870,12 @@ class PeerDownloader(threading.Thread):
                 self.unchoked = False
                 logger.info(f"Received CHOKE from {self.peer}")
             elif msg_id == PeerWireProtocol.HAVE:
-                logger.debug(f"Received HAVE message from {self.peer}")
+                piece_index = struct.unpack(">I", payload)[0]
+                logger.debug(f"Received HAVE for piece {piece_index}")
         
         logger.warning(f"Timeout waiting for bitfield from {self.peer}")
 
-    def _download_piece(self, piece_index: int):
+    def _download_piece(self, piece_index: int) -> bool:
         piece_length = self.torrent.piece_length
         if piece_index == self.torrent.num_pieces - 1:
             piece_length = (
@@ -601,6 +909,7 @@ class PeerDownloader(threading.Thread):
                     
                     # Verify block index and offset
                     if index != piece_index or begin_offset != begin:
+                        logger.warning(f"Received wrong block: expected {piece_index}:{begin}, got {index}:{begin_offset}")
                         continue  # Not the block we're waiting for
                     
                     # Critical: Check block length
@@ -615,26 +924,28 @@ class PeerDownloader(threading.Thread):
                 elif msg_id == PeerWireProtocol.CHOKE:
                     self.unchoked = False
                     logger.info(f"Choked by {self.peer} during download")
+                    return False
                 elif msg_id == PeerWireProtocol.UNCHOKE:
                     self.unchoked = True
                     logger.info(f"Unchoked by {self.peer}")
                 elif msg_id == PeerWireProtocol.HAVE:
-                    logger.debug(f"Received HAVE during download")
+                    piece_idx = struct.unpack(">I", payload)[0]
+                    logger.debug(f"Received HAVE for piece {piece_idx}")
             
             if not block_received:
                 logger.warning(f"Timeout downloading block {block_index} of piece {piece_index} from {self.peer}")
-                # Consider retrying the block instead of failing the entire piece
-                return
+                return False
         
         # Verify piece hash before saving
         computed_hash = hashlib.sha1(data).digest()
         expected_hash = self.torrent.piece_hashes[piece_index]
         if computed_hash != expected_hash:
             logger.error(f"Hash mismatch for piece {piece_index}. Expected {expected_hash.hex()}, got {computed_hash.hex()}")
-            return  # Or implement retry logic for the entire piece
+            return False
         
         self.piece_manager.save_piece(piece_index, data)
-        logger.info(f"Successfully downloaded and verified piece {piece_index}")
+        logger.info(f"Successfully downloaded and verified piece {piece_index} from {self.peer}")
+        return True
 
 class BitTorrentClient:
     def __init__(self, torrent_path: str, output_dir: str = "."):
