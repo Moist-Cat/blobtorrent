@@ -1,0 +1,12 @@
+# data
+torrent/
+out/
+log/
+
+# vim
+*~
+*.swp
+*.swo
+
+# py
+**/__pycache__/*

@@ -4,6 +4,7 @@ import logging
 from client import BitTorrentClient
 from log import master
 
+
 def main():
     parser = argparse.ArgumentParser(description="BitTorrent Client")
     parser.add_argument("torrent", help="Path to the torrent file")

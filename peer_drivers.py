@@ -14,6 +14,7 @@ import binascii
 from filesystem import BencodeDecoder
 from log import logged
 
+
 class PeerDiscovery(ABC):
     """Abstract base class for all peer discovery mechanisms"""
 
@@ -42,9 +43,20 @@ class PeerDiscovery(ABC):
         """Stop the peer discovery process"""
         pass
 
+    @abstractmethod
+    def update_stats(self, downloaded: int, uploaded: int, left: int):
+        """Update statistics for the discovery mechanism"""
+        pass
+
+
 @logged
 class TrackerDriver(PeerDiscovery):
-    def __init__(self, torrent: "TorrentFile", peer_id: bytes, piece_manager: "PieceManager", port: int = 6881):
+    def __init__(
+        self,
+        torrent: "TorrentFile",
+        peer_id: bytes,
+        port: int = 6881,
+    ):
         self.torrent = torrent
         self.peer_id = peer_id
         self.port = port
@@ -60,14 +72,14 @@ class TrackerDriver(PeerDiscovery):
         self.lock = threading.Lock()
         self._stop_announcing = False
         self.announce_thread: Optional[threading.Thread] = None
-        self.piece_manager = piece_manager
+        self.initialized = False
 
         # Get all announce URLs from the torrent
         self.announce_urls = self._get_announce_urls()
         self.current_announce_url_index = 0
 
         self.logger.info(
-            f"Tracker initialized for {torrent} with {len(self.announce_urls)} announce URLs"
+            f"TrackerDriver created for {torrent} with {len(self.announce_urls)} announce URLs"
         )
 
     def _get_announce_urls(self) -> List[str]:
@@ -99,7 +111,9 @@ class TrackerDriver(PeerDiscovery):
             self.current_announce_url_index = (
                 self.current_announce_url_index + 1
             ) % len(self.announce_urls)
-            self.logger.info(f"Rotated to announce URL: {self.get_current_announce_url()}")
+            self.logger.info(
+                f"Rotated to announce URL: {self.get_current_announce_url()}"
+            )
 
     def update_stats(self, downloaded: int, uploaded: int, left: int):
         """Update the tracker statistics"""
@@ -110,6 +124,10 @@ class TrackerDriver(PeerDiscovery):
 
     def announce(self, event: str = "") -> List[Tuple[str, int]]:
         """Announce to the tracker with optional event"""
+        if not self.initialized:
+            self.logger.error("Tracker not initialized")
+            return []
+            
         if not self.announce_urls:
             self.logger.error("No announce URLs available")
             return []
@@ -137,7 +155,9 @@ class TrackerDriver(PeerDiscovery):
 
         try:
             if parsed.scheme.startswith("http"):
-                self.logger.debug(f"Sending tracker request with params: {query_params}")
+                self.logger.debug(
+                    f"Sending tracker request with params: {query_params}"
+                )
                 response = requests.get(
                     url, params=query_params, headers=headers, timeout=30
                 )
@@ -231,8 +251,39 @@ class TrackerDriver(PeerDiscovery):
             self.rotate_announce_url()
             return []
 
-    def start_announcing(self, piece_manager: "PieceManager"):
-        """Start periodic announcing to the tracker"""
+    def initialize(self) -> bool:
+        """Initialize the tracker connection"""
+        try:
+            # Test the first announce URL to ensure it's valid
+            if self.announce_urls:
+                test_url = self.announce_urls[0]
+                parsed = urllib.parse.urlparse(test_url)
+                if not parsed.scheme.startswith("http"):
+                    self.logger.warning(f"Unsupported tracker scheme: {parsed.scheme}")
+                    return False
+                    
+                self.initialized = True
+                self.logger.info("TrackerDriver initialized successfully")
+                return True
+            else:
+                self.logger.error("No announce URLs available")
+                return False
+        except Exception as e:
+            self.logger.error(f"Failed to initialize TrackerDriver: {e}")
+            return False
+
+    def cleanup(self):
+        """Clean up tracker resources"""
+        self.stop_discovery()
+        self.initialized = False
+        self.logger.info("TrackerDriver cleaned up")
+
+    def start_discovery(self):
+        """Start the tracker discovery process"""
+        if not self.initialized:
+            self.logger.error("Tracker not initialized")
+            return
+            
         if self.announce_thread and self.announce_thread.is_alive():
             self.logger.warning("Announce thread is already running")
             return
@@ -245,12 +296,6 @@ class TrackerDriver(PeerDiscovery):
 
             while not self._stop_announcing:
                 try:
-                    # Update stats from piece manager
-                    downloaded = piece_manager.get_total_downloaded()
-                    uploaded = 0  # We're not uploading for now
-                    left = self.torrent.total_size - downloaded
-                    self.update_stats(downloaded, uploaded, left)
-
                     # Regular announce
                     self.announce()
 
@@ -264,7 +309,7 @@ class TrackerDriver(PeerDiscovery):
         self.announce_thread.start()
         self.logger.info("Started periodic tracker announcing")
 
-    def stop_announcing(self):
+    def stop_discovery(self):
         """Stop periodic announcing and send a final 'stopped' event"""
         self._stop_announcing = True
 
@@ -280,33 +325,17 @@ class TrackerDriver(PeerDiscovery):
         with self.lock:
             return self.peers.copy()
 
-    def initialize(self) -> bool:
-        """Initialize the tracker connection"""
-        # For HTTP trackers, initialization is always successful
-        return True
-        
-    def cleanup(self):
-        """Clean up tracker resources"""
-        self.stop_announcing()
-        
-    def start_discovery(self):
-        """Start the tracker discovery process"""
-        self.start_announcing(self.piece_manager)
-        
-    def stop_discovery(self):
-        """Stop the tracker discovery process"""
-        self.stop_announcing()
 
 @logged
-class LocalPeerDiscovery(PeerDiscovery):
+class LocalPeerDiscoveryDriver(PeerDiscovery):
     """Local Peer Discovery implementation for LAN environments"""
-    
+
     # LPD multicast address and port as per BEP 14
     LPD_MULTICAST_ADDR = "239.192.152.143"
     LPD_MULTICAST_PORT = 6771
     LPD_ANNOUNCE_INTERVAL = 300  # 5 minutes as per specification
-    
-    def __init__(self, torrent, peer_id, piece_manager, port=6881):
+
+    def __init__(self, torrent, peer_id, port=6881):
         self.torrent = torrent
         self.peer_id = peer_id
         self.port = port
@@ -315,38 +344,41 @@ class LocalPeerDiscovery(PeerDiscovery):
         self.running = False
         self.discovery_thread = None
         self.announce_thread = None
-        self.piece_manager = piece_manager
         self.lock = threading.Lock()
-    
+        self.initialized = False
+
     def initialize(self) -> bool:
         """Initialize LPD by creating a multicast socket"""
         try:
             # Create UDP socket
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            
+
             # Bind to the LPD port
-            self.socket.bind(('', self.LPD_MULTICAST_PORT))
-            
+            self.socket.bind(("", self.LPD_MULTICAST_PORT))
+
             # Add socket to multicast group
-            mreq = struct.pack("4sl", socket.inet_aton(self.LPD_MULTICAST_ADDR), socket.INADDR_ANY)
+            mreq = struct.pack(
+                "4sl", socket.inet_aton(self.LPD_MULTICAST_ADDR), socket.INADDR_ANY
+            )
             self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-            
+
             # Set socket timeout to allow for graceful shutdown
             self.socket.settimeout(1.0)
-            
+
+            self.initialized = True
             self.logger.info("LPD initialized successfully")
             return True
-            
+
         except Exception as e:
             self.logger.error(f"Failed to initialize LPD: {e}")
             return False
-    
+
     def get_peers(self) -> List[Tuple[str, int]]:
         """Get the current list of discovered peers"""
         with self.lock:
             return self.peers.copy()
-    
+
     def cleanup(self):
         """Clean up LPD resources"""
         self.stop_discovery()
@@ -356,39 +388,51 @@ class LocalPeerDiscovery(PeerDiscovery):
             except:
                 pass
             self.socket = None
+        self.initialized = False
         self.logger.info("LPD cleaned up")
-    
+
     def start_discovery(self):
         """Start the LPD discovery process"""
-        if self.running:
+        if not self.initialized:
+            self.logger.error("LPD not initialized")
             return
             
+        if self.running:
+            return
+
         self.running = True
-        
+
         # Start thread for receiving announcements
-        self.discovery_thread = threading.Thread(target=self._discovery_loop, daemon=True)
+        self.discovery_thread = threading.Thread(
+            target=self._discovery_loop, daemon=True
+        )
         self.discovery_thread.start()
-        
+
         # Start thread for sending announcements
         self.announce_thread = threading.Thread(target=self._announce_loop, daemon=True)
         self.announce_thread.start()
-        
+
         self.logger.info("LPD discovery started")
-    
+
     def stop_discovery(self):
         """Stop the LPD discovery process"""
         self.running = False
-        
+
         if self.discovery_thread:
             self.discovery_thread.join(timeout=5)
             self.discovery_thread = None
-            
+
         if self.announce_thread:
             self.announce_thread.join(timeout=5)
             self.announce_thread = None
-            
+
         self.logger.info("LPD discovery stopped")
-    
+
+    def update_stats(self, downloaded: int, uploaded: int, left: int):
+        """Update statistics - LPD doesn't use stats, but we need to implement the interface"""
+        # LPD doesn't use stats, so this is a no-op
+        pass
+
     def _discovery_loop(self):
         """Listen for LPD announcements from other peers"""
         while self.running and self.socket:
@@ -400,17 +444,17 @@ class LocalPeerDiscovery(PeerDiscovery):
             except Exception as e:
                 if self.running:  # Only log if we're still running
                     self.logger.error(f"Error in LPD discovery loop: {e}")
-    
+
     def _announce_loop(self):
         """Periodically send LPD announcements"""
         # Send initial announcement immediately
         self._send_announcement()
-        
+
         # Then send at regular intervals
         while self.running:
             time.sleep(self.LPD_ANNOUNCE_INTERVAL)
             self._send_announcement()
-    
+
     def _send_announcement(self):
         """Send an LPD announcement"""
         try:
@@ -421,48 +465,51 @@ class LocalPeerDiscovery(PeerDiscovery):
                 f"Port: {self.port}\r\n"
                 f"Infohash: {binascii.hexlify(self.torrent.info_hash).decode()}\r\n"
                 f"\r\n"
-            ).encode('utf-8')
-            
-            self.socket.sendto(message, (self.LPD_MULTICAST_ADDR, self.LPD_MULTICAST_PORT))
+            ).encode("utf-8")
+
+            self.socket.sendto(
+                message, (self.LPD_MULTICAST_ADDR, self.LPD_MULTICAST_PORT)
+            )
             self.logger.debug("Sent LPD announcement")
-            
+
         except Exception as e:
             self.logger.error(f"Failed to send LPD announcement: {e}")
-    
+
     def _process_announcement(self, data: bytes, source_ip: str):
         """Process an incoming LPD announcement"""
         try:
-            message = data.decode('utf-8')
-            lines = message.split('\r\n')
-            
+            message = data.decode("utf-8")
+            lines = message.split("\r\n")
+
             # Parse the announcement
             port = None
             infohash = None
-            
+
             for line in lines:
-                if line.startswith('Port:'):
-                    port = int(line.split(':')[1].strip())
-                elif line.startswith('Infohash:'):
-                    infohash = line.split(':')[1].strip()
-            
+                if line.startswith("Port:"):
+                    port = int(line.split(":")[1].strip())
+                elif line.startswith("Infohash:"):
+                    infohash = line.split(":")[1].strip()
+
             # Validate the announcement
             if not port or not infohash:
                 self.logger.debug("Invalid LPD announcement received")
                 return
-                
+
             # Check if the infohash matches our torrent
             if infohash != binascii.hexlify(self.torrent.info_hash).decode():
                 self.logger.debug(f"LPD announcement for different torrent: {infohash}")
                 return
-                
+
             # Add the peer to our list
             with self.lock:
                 peer = (source_ip, port)
                 if peer not in self.peers:
                     self.peers.append(peer)
                     self.logger.info(f"Discovered peer via LPD: {source_ip}:{port}")
-                    
+
         except Exception as e:
             self.logger.error(f"Error processing LPD announcement: {e}")
 
-DRIVERS = [TrackerDriver, LocalPeerDiscovery]
+
+DRIVERS = [TrackerDriver, LocalPeerDiscoveryDriver]

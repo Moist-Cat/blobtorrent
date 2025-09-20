@@ -11,8 +11,8 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(LOG_DIR / "bittorrent_client.log"),
-        logging.StreamHandler()
-    ]
+        logging.StreamHandler(),
+    ],
 )
 
 
@@ -24,6 +24,7 @@ def logged(cls) -> Callable:
     )
 
     return cls
+
 
 master = logging.getLogger(
     "master",
