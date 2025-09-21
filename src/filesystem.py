@@ -163,7 +163,12 @@ class TorrentFile:
                 self.logger.info(f"Single file torrent")
 
             self.num_pieces = math.ceil(self.total_size / self.piece_length)
-            self.announce = self.metadata.get(b"announce").decode()
+            announce = self.metadata.get(b"announce")
+            if announce:
+                self.announce = self.metadata.get(b"announce").decode()
+            else:
+                # trackerless
+                self.announce = None
 
             self.logger.info(f"Total size: {self.total_size} bytes")
             self.logger.info(f"Piece length: {self.piece_length} bytes")

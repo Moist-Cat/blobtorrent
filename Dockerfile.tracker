@@ -1,0 +1,14 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install dependencies
+RUN pip install aiohttp bencode.py
+
+RUN mkdir /out/ /log/
+
+# Expose tracker port
+EXPOSE 6969
+
+# Run tracker
+CMD ["python", "tracker.py"]

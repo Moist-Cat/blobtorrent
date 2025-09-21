@@ -1,0 +1,109 @@
+version: '3.8'
+
+services:
+  tracker:
+    image: blobtorrent-tracker:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.tracker
+    volumes:
+      - ./src:/app
+    networks:
+      - blobtorrent-net
+    deploy:
+      replicas: 3
+      update_config:
+        parallelism: 1
+        delay: 10s
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      placement:
+        constraints:
+          - node.role == manager
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  blobtorrent-node:
+    image: blobtorrent:latest
+    build: .
+    volumes:
+      - ./torrent:/torrent:ro
+      - ./src:/app
+    networks:
+      - blobtorrent-net
+    deploy:
+      replicas: 5
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    command: ["tail", "-f", "/dev/null"]
+
+  # Control node for managing the swarm
+  control-node:
+    image: blobtorrent:latest
+    volumes:
+      - ./torrent:/torrent:ro
+      - ./scripts:/scripts
+    networks:
+      - blobtorrent-net
+    deploy:
+      placement:
+        constraints: [node.role == manager]
+    command: ["tail", "-f", "/dev/null"]
+
+  # DNS server for custom domain resolution
+  dns-server:
+    image: sameersbn/bind:latest
+    environment:
+      - ROOT_PASSWORD=password
+    volumes:
+      - ./dns:/data
+    networks:
+      - blobtorrent-net
+    deploy:
+      placement:
+        constraints: [node.role == manager]
+    ports:
+      #- "53:53/udp"
+      #- "53:53/tcp"
+      - "10000:10000"  # Webmin
+
+  # Monitoring and visualization
+  monitor:
+    image: docker.io/portainer/portainer-ce:latest
+    command: -H unix:///var/run/docker.sock
+    volumes:
+      # dangerous!
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer-data:/data
+    networks:
+      - blobtorrent-net
+    deploy:
+      placement:
+        constraints: [node.role == manager]
+    ports:
+      - "9000:9000"
+
+volumes:
+  portainer-data:
+
+networks:
+  blobtorrent-net:
+    driver: overlay
+    attachable: true

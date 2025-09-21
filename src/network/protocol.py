@@ -3,6 +3,7 @@ import struct
 import hashlib
 import threading
 from typing import Tuple, Any, Optional
+import time
 
 from log import logged
 
@@ -77,6 +78,7 @@ class PeerWireProtocol:
         self.connected = False
         self.bitfield = None
         self.handshake_done = False
+        self.connection_timeout = 120  # 2 minutes timeout
         self.logger.debug(f"PeerWireProtocol initialized for {peer}")
 
     def __hash__(self):
@@ -173,6 +175,8 @@ class PeerWireProtocol:
                 self.logger.debug(f"Sending handshake to {self.peer} (outgoing)")
                 self.socket.send(handshake_msg)
 
+            # Set a shorter timeout for handshake
+            self.socket.settimeout(30)
             response = self._recv_exact(68)
             self.logger.debug(f"Received handshake response of length {len(response)}")
 
@@ -185,10 +189,20 @@ class PeerWireProtocol:
                 self.logger.error(f"Invalid handshake response from {self.peer}")
                 raise ConnectionError("Invalid handshake response")
 
+            their_peer_id = response[48:68]
+            
+            # Check for self-connection
+            if their_peer_id == self.peer_id:
+                self.logger.error(f"Detected self-connection to {self.peer}. Closing.")
+                self.close()
+                return False
+
             if is_incoming:
                 self.logger.debug(f"Sending handshake to {self.peer} (incoming)")
                 self.socket.send(handshake_msg)
 
+            # Set normal timeout after handshake
+            self.socket.settimeout(self.connection_timeout)
             self.handshake_done = True
             self.logger.info(f"Handshake successful with {self.peer}")
             return True
@@ -242,6 +256,9 @@ class PeerWireProtocol:
             
         Keep-alive messages have a length prefix of 0 and no message ID or payload.
         """
+        # Check if connection is still active
+        if not self.connected:
+            return None, None
         try:
             # Read exactly 4 bytes for the length prefix
             length_prefix = self._recv_exact(4)
@@ -314,6 +331,7 @@ class PeerWireProtocol:
             return True
         except Exception as e:
             self.logger.error(f"Failed to send message {message_id}: {e}")
+            self.close()
             return False
 
     def send_interested(self) -> bool:
@@ -376,8 +394,8 @@ class PeerWireProtocol:
         """Close the connection to the peer and clean up resources."""
         try:
             self.socket.close()
-            self.connected = False
-            self.handshake_done = False
-            self.logger.info(f"Closed connection to peer {self.peer}")
         except Exception as e:
             self.logger.error(f"Error closing connection to {self.peer}: {e}")
+        self.connected = False
+        self.handshake_done = False
+        self.logger.info(f"Closed connection to peer {self.peer}")

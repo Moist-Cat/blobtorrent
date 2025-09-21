@@ -74,7 +74,7 @@ class BitTorrentClient:
             self.piece_manager,
             self.connection_manager,
             # will change later
-            self.seeding,
+            False,
         )
 
         # Initialize discovery mechanisms
@@ -130,7 +130,8 @@ class BitTorrentClient:
             self.logger.info(
                 f"Stats: Downloaded: {stats['downloaded']} bytes, "
                 f"Speed: {stats['download_speed']/1024:.2f} KB/s, "
-                f"Peers: {stats['connected_peers']}/{stats['total_peers']}"
+                f"Peers: {stats['connected_peers']}/{stats['total_peers']}, "
+                f"State: {self.state}"
             )
 
     def _get_all_peers(self) -> Set[Tuple[str, int]]:
@@ -200,8 +201,17 @@ class BitTorrentClient:
         self.connection_manager.close_all()
         # less seeding connections
         self.connection_manager.max_connections = 20
-        self.peer_server.restart()
-        self.peer_server.is_seeding = self.seeding
+        # we could reload but I chose not to
+        self.peer_server.stop()
+        self.peer_server = PeerServer(
+            self.port,
+            self.torrent,
+            self.peer_id,
+            self.piece_manager,
+            self.connection_manager,
+            # will change later
+            True,
+        )
 
         self.logger.info("Download complete, transitioning to seeding")
 
@@ -270,7 +280,7 @@ class BitTorrentClient:
             self.logger.info("Client interrupted by user")
             self.state = BitTorrentClientState.STOPPED
         except Exception as e:
-            self.logger.error(f"Error in client: {e}")
+            self.logger.fatal(f"Error in client: {e}")
             self.state = BitTorrentClientState.ERROR
         finally:
             self._cleanup()
@@ -284,7 +294,7 @@ class BitTorrentClient:
             self.logger.info(f"Discovered {len(peers)} peers, starting download")
 
             if self.piece_manager.is_complete():
-                self._start_seeding(peers)
+                self._transition_to_seeding()
             else:
                 self._start_downloading(peers)
         else:
@@ -303,10 +313,10 @@ class BitTorrentClient:
             return
 
         # Refresh peers periodically
-        if int(time.time()) % 300 == 0:  # Every 5 minutes
+        if int(time.time()) % 30 == 0:  # Every 5 minutes
             peers = list(self._get_all_peers())
             for peer in peers:
-                if not self.connection_manager.already_connected_to(peer):
+                if self.connection_manager.already_connected_to(peer):
                     continue
                 self.logger.info(f"Adding {peer} to new peers")
                 connection = ActiveConnection(
@@ -318,16 +328,15 @@ class BitTorrentClient:
                 )
                 if self.connection_manager.add_connection(connection):
                     connection.start()
-                    self.active_connections.add(connection)
                     self.logger.info(f"Started download connection to {peer}")
 
     def _handle_seeding_state(self):
         """Handle the seeding state"""
         # Refresh peers periodically
-        if int(time.time()) % 300 == 0:  # Every 5 minutes
+        if int(time.time()) % 30 == 0:  # Every 5 minutes
             peers = list(self._get_all_peers())
             for peer in peers:
-                if not self.connection_manager.already_connected_to(peer):
+                if self.connection_manager.already_connected_to(peer):
                     continue
                 self.logger.info(f"Adding {peer} to new peers")
                 connection = ActiveConnection(
@@ -339,7 +348,6 @@ class BitTorrentClient:
                 )
                 if self.connection_manager.add_connection(connection):
                     connection.start()
-                    self.active_connections.add(connection)
                     self.logger.info(f"Started seed connection to {peer}")
 
     def _handle_paused_state(self):

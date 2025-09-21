@@ -10,3 +10,5 @@ log/
 
 # py
 **/__pycache__/*
+
+dns/
