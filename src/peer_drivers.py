@@ -522,6 +522,7 @@ class DHTDiscovery(PeerDiscovery):
     
     def __init__(self, torrent, peer_id, port=6881, dht_port=7882):
         self.torrent = torrent
+        self.dht_id = self._generate_node_id()
         self.peer_id = peer_id
         self.port = port
         self.dht_port = dht_port
@@ -721,7 +722,7 @@ class DHTDiscovery(PeerDiscovery):
                 b"t": t,
                 b"y": b"r",
                 b"r": {
-                    b"id": self._generate_node_id()
+                    b"id": self.dht_id
                 }
             }
             
@@ -738,7 +739,7 @@ class DHTDiscovery(PeerDiscovery):
                 b"t": t,
                 b"y": b"r",
                 b"r": {
-                    b"id": self._generate_node_id(),
+                    b"id": self.dht_id,
                     b"nodes": self._get_closest_nodes(a.get(b"target", b""))
                 }
             }
@@ -762,7 +763,7 @@ class DHTDiscovery(PeerDiscovery):
                     b"t": t,
                     b"y": b"r",
                     b"r": {
-                        b"id": self._generate_node_id(),
+                        b"id": self.dht_id,
                         b"values": peers
                     }
                 }
@@ -772,7 +773,7 @@ class DHTDiscovery(PeerDiscovery):
                     b"t": t,
                     b"y": b"r",
                     b"r": {
-                        b"id": self._generate_node_id(),
+                        b"id": self.dht_id,
                         b"nodes": self._get_closest_nodes(info_hash),
                         b"token": self._generate_token(addr)
                     }
@@ -813,7 +814,7 @@ class DHTDiscovery(PeerDiscovery):
                 b"t": t,
                 b"y": b"r",
                 b"r": {
-                    b"id": self._generate_node_id()
+                    b"id": self.dht_id
                 }
             }
             
@@ -884,12 +885,13 @@ class DHTDiscovery(PeerDiscovery):
                 b"y": b"q",
                 b"q": b"ping",
                 b"a": {
-                    b"id": self._generate_node_id()
+                    b"id": self.dht_id
                 }
             }
             
             self.transactions[t] = {"type": "ping", "node": node}
             self._send_message(message, node)
+            self.logger.info("Sent ping to %s", node)
             
         except Exception as e:
             self.logger.error("Error sending ping to %s: %s", node, e)
@@ -903,7 +905,7 @@ class DHTDiscovery(PeerDiscovery):
                 b"y": b"q",
                 b"q": b"find_node",
                 b"a": {
-                    b"id": self._generate_node_id(),
+                    b"id": self.dht_id,
                     b"target": target
                 }
             }
@@ -923,7 +925,7 @@ class DHTDiscovery(PeerDiscovery):
                 b"y": b"q",
                 b"q": b"get_peers",
                 b"a": {
-                    b"id": self._generate_node_id(),
+                    b"id": self.dht_id,
                     b"info_hash": info_hash
                 }
             }
@@ -943,7 +945,7 @@ class DHTDiscovery(PeerDiscovery):
                 b"y": b"q",
                 b"q": b"announce_peer",
                 b"a": {
-                    b"id": self._generate_node_id(),
+                    b"id": self.dht_id,
                     b"info_hash": info_hash,
                     b"port": self.port,
                     b"token": token
@@ -969,10 +971,7 @@ class DHTDiscovery(PeerDiscovery):
         return os.urandom(2)
         
     def _generate_node_id(self) -> bytes:
-        """Generate a DHT node ID"""
-        # In a real implementation, this should be a secure random ID
-        # For now, we'll use a hash of our peer ID
-        return hashlib.sha1(self.peer_id).digest()
+        return os.urandom(20)
         
     def _generate_token(self, addr: Tuple[str, int]) -> bytes:
         """Generate a token for announce_peer validation"""
