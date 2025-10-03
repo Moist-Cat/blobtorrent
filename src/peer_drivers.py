@@ -14,6 +14,9 @@ import random
 from typing import List, Tuple, Dict, Set, Optional
 import threading
 import hashlib
+import ipaddress
+import concurrent.futures
+import threading
 
 from filesystem import BencodeDecoder, BencodeEncoder
 from log import logged
@@ -520,7 +523,7 @@ class LocalPeerDiscoveryDriver(PeerDiscovery):
 class DHTDiscovery(PeerDiscovery):
     """Distributed Hash Table (DHT) implementation for peer discovery (BEP 5)"""
     
-    def __init__(self, torrent, peer_id, port=6881, dht_port=7882):
+    def __init__(self, torrent, peer_id, port=6881, dht_port=7883):
         self.torrent = torrent
         self.dht_id = self._generate_node_id()
         self.peer_id = peer_id
@@ -531,12 +534,13 @@ class DHTDiscovery(PeerDiscovery):
         self.socket = None
         self.running = False
         self.dht_thread = None
+        self.announce_thread = None
         self.lock = threading.Lock()
         self.initialized = False
         self.transactions = {}  # Track ongoing transactions
 
-        #self.bootstrap_nodes = bootstrap_nodes or [
-        #    ("blobtorrent-node", 6881),
+        #self.bootstrap_nodes = [
+        #    ("blobtorrent-node", 7882),
         #]
         self.bootstrap_nodes = [
             ("router.bittorrent.com", 6881),
@@ -552,7 +556,6 @@ class DHTDiscovery(PeerDiscovery):
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.socket.bind(("0.0.0.0", self.dht_port))
-            self.socket.settimeout(1.0)
             
             # Add bootstrap nodes
             self.nodes.extend(self.bootstrap_nodes)
@@ -599,6 +602,18 @@ class DHTDiscovery(PeerDiscovery):
         
         # Bootstrap the DHT
         self._bootstrap()
+
+        def announce_loop():
+            while not self.running:
+                try:
+                    # Regular announce
+                    self._bootstrap()
+                    # Sleep for the interval
+                    time.sleep(60)
+                except Exception as e:
+                    self.logger.error(f"Error in announce loop: {e}")
+                    time.sleep(60)  # Wait a minute before retrying
+        self.announce_thread = threading.Thread(target=announce_loop, daemon=True)
         
         self.logger.info("DHT discovery started")
         
@@ -827,6 +842,7 @@ class DHTDiscovery(PeerDiscovery):
         """Handle ping response"""
         # Add node to our routing table
         self._add_node(addr)
+        self._send_get_peers(addr, self.torrent.info_hash)
         
     def _handle_find_node_response(self, message: dict, addr: Tuple[str, int]):
         """Handle find_node response"""
@@ -873,7 +889,8 @@ class DHTDiscovery(PeerDiscovery):
         
     def _bootstrap(self):
         """Bootstrap the DHT by pinging initial nodes"""
-        for node in self.bootstrap_nodes:
+        self.logger.info("Bootstrapping with %d nodes", len(self.nodes))
+        for node in self.nodes:
             self._send_ping(node)
             
     def _send_ping(self, node: Tuple[str, int]):
@@ -989,6 +1006,7 @@ class DHTDiscovery(PeerDiscovery):
     def _add_node(self, addr: Tuple[str, int]):
         """Add a node to our routing table"""
         if addr not in self.nodes:
+            self.logger.info("Added %s to the DHT routing table", addr)
             self.nodes.append(addr)
             
     def _add_nodes_from_compact(self, nodes: bytes):
@@ -1034,6 +1052,7 @@ class DHTDiscovery(PeerDiscovery):
             # Add ourselves as a peer
             try:
                 # Get our external IP (simplified)
+                # Too simplified!
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 s.connect(("8.8.8.8", 80))
                 our_ip = s.getsockname()[0]
@@ -1046,5 +1065,460 @@ class DHTDiscovery(PeerDiscovery):
                 
         return peers
 
-#DRIVERS = [TrackerDriver, LocalPeerDiscoveryDriver, DHTDiscovery]
+@logged
+class SubnetScannerDriver(PeerDiscovery):
+    """Aggressive subnet scanner that discovers peers by scanning local network"""
+
+    # Common BitTorrent ports to scan
+    COMMON_PORTS = [6881, 6882, 6883, 6884, 6885, 6886, 6887, 6888, 6889, 6890,
+                    6969, 6999, 8999, 9999, 10000, 10001]
+
+    # Maximum number of concurrent connection attempts
+    MAX_WORKERS = 50
+
+    # Scan configuration
+    SCAN_INTERVAL = 300  # 5 minutes between full scans
+    CONNECTION_TIMEOUT = 0.001 # ha-hayai!
+
+    def __init__(self, torrent, peer_id, port=6881,
+                 subnet_cidr: str = None,
+                 custom_ports: List[int] = None):
+        self.torrent = torrent
+        self.peer_id = peer_id
+        self.port = port
+        self.peers: List[Tuple[str, int]] = []
+        self.lock = threading.Lock()
+        self.running = False
+        self.scan_thread = None
+        self.initialized = False
+
+        # Network configuration
+        self.subnet_cidr = subnet_cidr or self._detect_local_subnet()
+        self.ports_to_scan = custom_ports or self.COMMON_PORTS
+
+        # Statistics
+        self.scan_attempts = 0
+        self.successful_discoveries = 0
+        self.last_scan_time = 0
+
+        self.logger.info(f"SubnetScanner initialized for subnet: {self.subnet_cidr}")
+
+    def _detect_local_subnet(self) -> str:
+        """Detect the local subnet automatically"""
+        try:
+            # Try to connect to a remote host to determine our interface
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+
+            # Common subnet masks based on private IP ranges
+            if local_ip.startswith('10.'):
+                return '10.0.0.0/8'
+            elif local_ip.startswith('172.16.'):
+                return '172.16.0.0/12'
+            elif local_ip.startswith('192.168.'):
+                return '192.168.0.0/16'
+            elif local_ip.startswith('169.254.'):
+                return '169.254.0.0/16'  # Link-local
+            else:
+                # Assume /24 for other private IPs
+                ip_parts = local_ip.split('.')
+                return f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.0/24"
+
+        except Exception as e:
+            self.logger.warning(f"Failed to detect local subnet: {e}")
+            return '192.168.1.0/24'  # Fallback to common home network
+
+    def initialize(self) -> bool:
+        """Initialize the subnet scanner"""
+        try:
+            # Validate the subnet
+            network = ipaddress.ip_network(self.subnet_cidr, strict=False)
+            num_hosts = network.num_addresses - 2  # Exclude network and broadcast
+
+            if num_hosts > 65536:  # Limit to reasonable size
+                self.logger.warning(f"Subnet {self.subnet_cidr} is too large, limiting scan")
+                return False
+
+            self.initialized = True
+            self.logger.info(f"SubnetScanner initialized for {self.subnet_cidr} "
+                           f"({num_hosts} hosts, {len(self.ports_to_scan)} ports)")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize SubnetScanner: {e}")
+            return False
+
+    def get_peers(self) -> List[Tuple[str, int]]:
+        """Get the current list of discovered peers"""
+        with self.lock:
+            return self.peers.copy()
+
+    def cleanup(self):
+        """Clean up scanner resources"""
+        self.stop_discovery()
+        self.initialized = False
+        self.logger.info("SubnetScanner cleaned up")
+
+    def start_discovery(self):
+        """Start the subnet scanning process"""
+        if not self.initialized:
+            self.logger.error("SubnetScanner not initialized")
+            return
+
+        if self.running:
+            return
+
+        self.running = True
+        self.scan_thread = threading.Thread(target=self._scan_loop, daemon=True)
+        self.scan_thread.start()
+        self.logger.info("SubnetScanner discovery started")
+
+    def stop_discovery(self):
+        """Stop the subnet scanning process"""
+        self.running = False
+        if self.scan_thread:
+            self.scan_thread.join(timeout=10)
+            self.scan_thread = None
+        self.logger.info("SubnetScanner discovery stopped")
+
+    def update_stats(self, downloaded: int, uploaded: int, left: int):
+        """Update statistics - scanner doesn't use torrent stats"""
+        pass
+
+    def _scan_loop(self):
+        """Main scanning loop"""
+        # Run initial scan immediately
+        self._perform_scan()
+
+        # Then scan at regular intervals
+        while self.running:
+            time.sleep(self.SCAN_INTERVAL)
+            if self.running:
+                self._perform_scan()
+
+    def _perform_scan(self):
+        """Perform a full subnet scan"""
+        try:
+            self.logger.info(f"Starting subnet scan: {self.subnet_cidr}")
+            start_time = time.time()
+
+            network = ipaddress.ip_network(self.subnet_cidr, strict=False)
+            hosts_to_scan = list(network.hosts())
+
+            self.logger.info(f"Scanning {len(hosts_to_scan)} hosts on {len(self.ports_to_scan)} ports")
+
+            # Use thread pool for concurrent scanning
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.MAX_WORKERS,
+                thread_name_prefix="subnet_scanner"
+            ) as executor:
+                # Submit all scan tasks
+                future_to_target = {
+                    executor.submit(self._check_host_port, str(host), port): (str(host), port)
+                    for host in hosts_to_scan
+                    for port in self.ports_to_scan
+                }
+
+                # Process results as they complete
+                for future in concurrent.futures.as_completed(future_to_target):
+                    if not self.running:
+                        break
+
+                    target = future_to_target[future]
+                    try:
+                        result = future.result()
+                        if result:
+                            ip, port = result
+                            self._add_peer(ip, port)
+                    except Exception as e:
+                        self.logger.debug(f"Scan task failed for {target}: {e}")
+
+            scan_duration = time.time() - start_time
+            self.last_scan_time = time.time()
+            self.scan_attempts += 1
+
+            self.logger.info(f"Scan completed in {scan_duration:.2f}s. "
+                           f"Found {self.successful_discoveries} peers total")
+
+        except Exception as e:
+            self.logger.error(f"Error during subnet scan: {e}")
+
+    def _check_host_port(self, ip: str, port: int) -> Tuple[str, int]:
+        """Check if a specific host:port is a BitTorrent peer"""
+        self.scan_attempts += 1
+
+        try:
+            # Skip localhost and our own IP
+            if ip in ['127.0.0.1', 'localhost', '0.0.0.0']:
+                return None
+
+            # Create socket with timeout
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(self.CONNECTION_TIMEOUT)
+
+                # Attempt connection
+                result = sock.connect_ex((ip, port))
+                print((ip, port))
+
+                if result == 0:
+                    # Connection successful - this might be a BitTorrent peer
+                    self.logger.debug(f"Found open port {ip}:{port}")
+
+                    # Try to perform a quick handshake to verify it's a BitTorrent peer
+                    if self._verify_bittorrent_peer(ip, port):
+                        self.logger.info(f"Verified BitTorrent peer: {ip}:{port}")
+                        return (ip, port)
+                    else:
+                        self.logger.debug(f"Port {ip}:{port} open but not BitTorrent")
+
+        except socket.timeout:
+            pass  # Expected for most hosts
+        except ConnectionRefusedError:
+            pass  # Expected for closed ports
+        except Exception as e:
+            self.logger.debug(f"Error checking {ip}:{port}: {e}")
+
+        return None
+
+    def _verify_bittorrent_peer(self, ip: str, port: int) -> bool:
+        """Perform a quick verification to check if this is a BitTorrent peer"""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(3)  # Shorter timeout for verification
+
+                # Connect and send handshake
+                sock.connect((ip, port))
+
+                # Send handshake
+                handshake = self._create_handshake()
+                sock.send(handshake)
+
+                # Wait for response (partial is enough)
+                sock.settimeout(1)
+                response = sock.recv(1)  # Just check if we get any response
+
+                # If we get any response, it's likely a BitTorrent peer
+                return len(response) > 0
+
+        except Exception as e:
+            self.logger.debug(f"Peer verification failed for {ip}:{port}: {e}")
+            return False
+
+    def _create_handshake(self) -> bytes:
+        """Create a BitTorrent handshake message"""
+        # NOTE duplicate code
+        return (
+            b"\x13BitTorrent protocol" +
+            b"\x00" * 8 +
+            self.torrent.info_hash +
+            self.peer_id
+        )
+
+    def _add_peer(self, ip: str, port: int):
+        """Add a discovered peer to the list"""
+        with self.lock:
+            peer = (ip, port)
+            if peer not in self.peers:
+                self.peers.append(peer)
+                self.successful_discoveries += 1
+                self.logger.info(f"Discovered peer via subnet scan: {ip}:{port}")
+
+    def get_scan_stats(self) -> dict:
+        """Get scanning statistics"""
+        with self.lock:
+            return {
+                'subnet': self.subnet_cidr,
+                'total_peers': len(self.peers),
+                'scan_attempts': self.scan_attempts,
+                'successful_discoveries': self.successful_discoveries,
+                'last_scan_time': self.last_scan_time,
+                'ports_scanned': len(self.ports_to_scan),
+                'is_running': self.running
+            }
+
+    def set_subnet(self, subnet_cidr: str):
+        """Update the subnet to scan"""
+        try:
+            network = ipaddress.ip_network(subnet_cidr, strict=False)
+            self.subnet_cidr = subnet_cidr
+            self.logger.info(f"Updated scan subnet to: {subnet_cidr}")
+        except Exception as e:
+            self.logger.error(f"Invalid subnet {subnet_cidr}: {e}")
+
+    def add_custom_port(self, port: int):
+        """Add a custom port to scan"""
+        if port not in self.ports_to_scan:
+            self.ports_to_scan.append(port)
+            self.logger.info(f"Added custom port to scan: {port}")
+
+    def remove_custom_port(self, port: int):
+        """Remove a port from scanning"""
+        if port in self.ports_to_scan:
+            self.ports_to_scan.remove(port)
+            self.logger.info(f"Removed port from scan: {port}")
+
+@logged
+class SmartSubnetScannerDriver(SubnetScannerDriver):
+    """Enhanced subnet scanner with intelligent scanning strategies"""
+
+    def __init__(self, torrent, peer_id, port=6881, subnet_cidr: str = None):
+        super().__init__(torrent, peer_id, port, subnet_cidr)
+
+        # Smart scanning features
+        self.learned_ports: Set[int] = set()  # Ports we've found peers on
+        self.active_peers: Set[Tuple[str, int]] = set()  # Recently active peers
+        self.failed_hosts: Set[str] = set()  # Hosts that consistently fail
+        self.scan_strategy = "aggressive"  # aggressive, conservative, targeted
+
+        # Adaptive scanning
+        self.min_scan_interval = 60  # 1 minute minimum
+        self.max_scan_interval = 1800  # 30 minutes maximum
+        self.current_scan_interval = self.SCAN_INTERVAL
+
+    def _perform_scan(self):
+        """Perform smart scanning based on current strategy"""
+        if self.scan_strategy == "targeted":
+            self._targeted_scan()
+        elif self.scan_strategy == "conservative":
+            self._conservative_scan()
+        else:  # aggressive
+            super()._perform_scan()
+
+        self._adjust_scan_strategy()
+
+    def _targeted_scan(self):
+        """Scan only known active IP ranges and ports"""
+        self.logger.info("Performing targeted scan")
+
+        # Focus on IPs near previously found peers
+        target_ips = self._generate_target_ips()
+        target_ports = list(self.learned_ports) if self.learned_ports else self.ports_to_scan
+
+        self._scan_targets(target_ips, target_ports)
+
+    def _conservative_scan(self):
+        """Slow, careful scanning to avoid network congestion"""
+        self.logger.info("Performing conservative scan")
+
+        network = ipaddress.ip_network(self.subnet_cidr, strict=False)
+        hosts = list(network.hosts())
+
+        # Sample a subset of hosts
+        sample_size = min(50, len(hosts))
+        target_ips = [str(host) for host in hosts[:sample_size]]
+
+        # Use only common ports
+        target_ports = self.ports_to_scan[:5]  # First 5 common ports
+
+        self._scan_targets(target_ips, target_ports)
+
+    def _generate_target_ips(self) -> List[str]:
+        """Generate IP targets based on previously found peers"""
+        target_ips = set()
+
+        # Add IPs of known peers
+        for ip, port in self.active_peers:
+            target_ips.add(ip)
+
+        # Add nearby IPs (same /24 subnet as known peers)
+        for ip, port in self.active_peers:
+            ip_obj = ipaddress.ip_address(ip)
+            network_24 = ipaddress.ip_network(f"{ip}/24", strict=False)
+            for host in list(network_24.hosts())[:10]:  # First 10 hosts in /24
+                target_ips.add(str(host))
+
+        return list(target_ips)
+
+    def _scan_targets(self, ips: List[str], ports: List[int]):
+        """Scan specific IPs and ports"""
+        if not ips or not ports:
+            return
+
+        self.logger.info(f"Scanning {len(ips)} IPs on {len(ports)} ports")
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(self.MAX_WORKERS, len(ips) * len(ports))
+        ) as executor:
+            future_to_target = {
+                executor.submit(self._check_host_port, ip, port): (ip, port)
+                for ip in ips
+                for port in ports
+                if ip not in self.failed_hosts  # Skip known failed hosts
+            }
+
+            for future in concurrent.futures.as_completed(future_to_target):
+                if not self.running:
+                    break
+
+                target = future_to_target[future]
+                try:
+                    result = future.result()
+                    if result:
+                        ip, port = result
+                        self._add_peer(ip, port)
+                        self.learned_ports.add(port)
+                        self.active_peers.add((ip, port))
+                except Exception:
+                    pass
+
+    def _adjust_scan_strategy(self):
+        """Adjust scanning strategy based on results"""
+        peer_count = len(self.peers)
+
+        if peer_count == 0:
+            # No peers found, be more aggressive
+            self.scan_strategy = "aggressive"
+            self.current_scan_interval = self.min_scan_interval
+        elif peer_count < 5:
+            # Few peers, use targeted scanning
+            self.scan_strategy = "targeted"
+            self.current_scan_interval = self.SCAN_INTERVAL
+        else:
+            # Many peers, be conservative
+            self.scan_strategy = "conservative"
+            self.current_scan_interval = self.max_scan_interval
+
+        self.logger.debug(f"Adjusted strategy to {self.scan_strategy}, "
+                         f"interval: {self.current_scan_interval}s")
+
+    def _scan_loop(self):
+        """Smart scanning loop with adaptive intervals"""
+        while self.running:
+            self._perform_scan()
+
+            # Use adaptive interval
+            sleep_time = self.current_scan_interval
+            self.logger.debug(f"Next scan in {sleep_time}s")
+
+            # Sleep in chunks to allow for quick shutdown
+            for _ in range(sleep_time):
+                if not self.running:
+                    break
+                time.sleep(1)
+
+    def set_scan_strategy(self, strategy: str):
+        """Manually set scanning strategy"""
+        valid_strategies = ["aggressive", "conservative", "targeted"]
+        if strategy in valid_strategies:
+            self.scan_strategy = strategy
+            self.logger.info(f"Scan strategy set to: {strategy}")
+        else:
+            self.logger.error(f"Invalid scan strategy: {strategy}")
+
+    def get_scan_stats(self) -> dict:
+        """Get enhanced scanning statistics"""
+        base_stats = super().get_scan_stats()
+        base_stats.update({
+            'scan_strategy': self.scan_strategy,
+            'learned_ports': len(self.learned_ports),
+            'active_peers': len(self.active_peers),
+            'failed_hosts': len(self.failed_hosts),
+            'current_interval': self.current_scan_interval
+        })
+        return base_stats
+
+#DRIVERS = [TrackerDriver, LocalPeerDiscoveryDriver, SmartSubnetScannerDriver]
 DRIVERS = [DHTDiscovery,]
+#DRIVERS = [LocalPeerDiscoveryDriver,]
+#DRIVERS = [SmartSubnetScannerDriver,]
