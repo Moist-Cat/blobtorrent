@@ -16,7 +16,7 @@ class BencodeDecoder:
             if data.startswith(b"i"):
                 end_pos = data.find(b"e", 1)
                 number = int(data[1:end_pos])
-                #logger.debug(f"Decoded integer: {number}")
+                # logger.debug(f"Decoded integer: {number}")
                 return number, end_pos + 1
             elif data.startswith(b"l"):
                 list_data = []
@@ -36,7 +36,7 @@ class BencodeDecoder:
                     value, value_len = BencodeDecoder.decode(data[pos:])
                     pos += value_len
                     dict_data[key] = value
-                #logger.debug(f"Decoded dictionary with {len(dict_data)} keys")
+                # logger.debug(f"Decoded dictionary with {len(dict_data)} keys")
                 return dict_data, pos + 1
             elif data[0:1] in b"0123456789":
                 colon_pos = data.find(b":")
@@ -44,7 +44,7 @@ class BencodeDecoder:
                 start = colon_pos + 1
                 end = start + length
                 string_data = data[start:end]
-                #logger.debug(f"Decoded string of length {length}")
+                # logger.debug(f"Decoded string of length {length}")
                 return string_data, end
             else:
                 raise ValueError("Invalid bencoded data")

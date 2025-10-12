@@ -17,6 +17,9 @@ import hashlib
 import ipaddress
 import concurrent.futures
 import threading
+import select
+import subprocess
+import re
 
 from filesystem import BencodeDecoder, BencodeEncoder
 from log import logged
@@ -134,7 +137,7 @@ class TrackerDriver(PeerDiscovery):
         if not self.initialized:
             self.logger.error("Tracker not initialized")
             return []
-            
+
         if not self.announce_urls:
             self.logger.error("No announce URLs available")
             return []
@@ -268,7 +271,7 @@ class TrackerDriver(PeerDiscovery):
                 if not parsed.scheme.startswith("http"):
                     self.logger.warning(f"Unsupported tracker scheme: {parsed.scheme}")
                     return False
-                    
+
                 self.initialized = True
                 self.logger.info("TrackerDriver initialized successfully")
                 return True
@@ -290,7 +293,7 @@ class TrackerDriver(PeerDiscovery):
         if not self.initialized:
             self.logger.error("Tracker not initialized")
             return
-            
+
         if self.announce_thread and self.announce_thread.is_alive():
             self.logger.warning("Announce thread is already running")
             return
@@ -362,7 +365,7 @@ class LocalPeerDiscoveryDriver(PeerDiscovery):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
             # Bind to the LPD port
-            #self.socket.bind(("", self.LPD_MULTICAST_PORT))
+            # self.socket.bind(("", self.LPD_MULTICAST_PORT))
             self.socket.bind(("", self.LPD_MULTICAST_PORT))
 
             # Add socket to multicast group
@@ -404,7 +407,7 @@ class LocalPeerDiscoveryDriver(PeerDiscovery):
         if not self.initialized:
             self.logger.error("LPD not initialized")
             return
-            
+
         if self.running:
             return
 
@@ -519,10 +522,11 @@ class LocalPeerDiscoveryDriver(PeerDiscovery):
         except Exception as e:
             self.logger.error(f"Error processing LPD announcement: {e}")
 
+
 @logged
 class DHTDiscovery(PeerDiscovery):
     """Distributed Hash Table (DHT) implementation for peer discovery (BEP 5)"""
-    
+
     def __init__(self, torrent, peer_id, port=6881, dht_port=7883):
         self.torrent = torrent
         self.dht_id = self._generate_node_id()
@@ -539,16 +543,16 @@ class DHTDiscovery(PeerDiscovery):
         self.initialized = False
         self.transactions = {}  # Track ongoing transactions
 
-        #self.bootstrap_nodes = [
+        # self.bootstrap_nodes = [
         #    ("blobtorrent-node", 7882),
-        #]
+        # ]
         self.bootstrap_nodes = [
             ("router.bittorrent.com", 6881),
             ("dht.transmissionbt.com", 6881),
             ("router.utorrent.com", 6881),
-            ("dht.aelitis.com", 6881)
+            ("dht.aelitis.com", 6881),
         ]
-        
+
     def initialize(self) -> bool:
         """Initialize DHT by creating a UDP socket and joining the DHT network"""
         try:
@@ -556,23 +560,23 @@ class DHTDiscovery(PeerDiscovery):
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.socket.bind(("0.0.0.0", self.dht_port))
-            
+
             # Add bootstrap nodes
             self.nodes.extend(self.bootstrap_nodes)
-            
+
             self.initialized = True
             self.logger.info("DHT initialized successfully on port %d", self.dht_port)
             return True
-            
+
         except Exception as e:
             self.logger.error("Failed to initialize DHT: %s", e)
             return False
-            
+
     def get_peers(self) -> List[Tuple[str, int]]:
         """Get the current list of discovered peers"""
         with self.lock:
             return self.peers.copy()
-            
+
     def cleanup(self):
         """Clean up DHT resources"""
         self.stop_discovery()
@@ -584,22 +588,22 @@ class DHTDiscovery(PeerDiscovery):
             self.socket = None
         self.initialized = False
         self.logger.info("DHT cleaned up")
-        
+
     def start_discovery(self):
         """Start the DHT discovery process"""
         if not self.initialized:
             self.logger.error("DHT not initialized")
             return
-            
+
         if self.running:
             return
-            
+
         self.running = True
-        
+
         # Start DHT thread
         self.dht_thread = threading.Thread(target=self._dht_loop, daemon=True)
         self.dht_thread.start()
-        
+
         # Bootstrap the DHT
         self._bootstrap()
 
@@ -613,25 +617,26 @@ class DHTDiscovery(PeerDiscovery):
                 except Exception as e:
                     self.logger.error(f"Error in announce loop: {e}")
                     time.sleep(60)  # Wait a minute before retrying
+
         self.announce_thread = threading.Thread(target=announce_loop, daemon=True)
-        
+
         self.logger.info("DHT discovery started")
-        
+
     def stop_discovery(self):
         """Stop the DHT discovery process"""
         self.running = False
-        
+
         if self.dht_thread:
             self.dht_thread.join(timeout=5)
             self.dht_thread = None
-            
+
         self.logger.info("DHT discovery stopped")
-        
+
     def update_stats(self, downloaded: int, uploaded: int, left: int):
         """Update statistics - DHT doesn't use stats, but we need to implement the interface"""
         # DHT doesn't use stats, so this is a no-op
         pass
-        
+
     def _dht_loop(self):
         """Main DHT loop for handling incoming messages"""
         while self.running and self.socket:
@@ -639,13 +644,13 @@ class DHTDiscovery(PeerDiscovery):
                 # Receive data
                 data, addr = self.socket.recvfrom(2048)
                 self._handle_message(data, addr)
-                
+
             except socket.timeout:
                 continue
             except Exception as e:
                 if self.running:
                     self.logger.error("Error in DHT loop: %s", e)
-                    
+
     def _handle_message(self, data: bytes, addr: Tuple[str, int]):
         """Handle incoming DHT message"""
         try:
@@ -653,10 +658,10 @@ class DHTDiscovery(PeerDiscovery):
             message = BencodeDecoder.decode_full(data)
             if not isinstance(message, dict):
                 return
-                
+
             # Get message type
             msg_type = message.get(b"y", b"")
-            
+
             if msg_type == b"r":
                 # Response
                 self._handle_response(message, addr)
@@ -666,10 +671,10 @@ class DHTDiscovery(PeerDiscovery):
             elif msg_type == b"e":
                 # Error
                 self._handle_error(message, addr)
-                
+
         except Exception as e:
             self.logger.error("Error handling DHT message from %s: %s", addr, e)
-            
+
     def _handle_response(self, message: dict, addr: Tuple[str, int]):
         """Handle DHT response message"""
         try:
@@ -677,11 +682,11 @@ class DHTDiscovery(PeerDiscovery):
             t = message.get(b"t")
             if t not in self.transactions:
                 return
-                
+
             # Get the original query info
             query_info = self.transactions[t]
             query_type = query_info["type"]
-            
+
             # Handle based on query type
             if query_type == "ping":
                 self._handle_ping_response(message, addr)
@@ -691,20 +696,20 @@ class DHTDiscovery(PeerDiscovery):
                 self._handle_get_peers_response(message, addr)
             elif query_type == "announce_peer":
                 self._handle_announce_peer_response(message, addr)
-                
+
             # Remove completed transaction
             del self.transactions[t]
-            
+
         except Exception as e:
             self.logger.error("Error handling DHT response from %s: %s", addr, e)
-            
+
     def _handle_query(self, message: dict, addr: Tuple[str, int]):
         """Handle DHT query message"""
         try:
             q = message.get(b"q", b"")
             a = message.get(b"a", {})
             t = message.get(b"t", b"")
-            
+
             if q == b"ping":
                 self._handle_ping_query(a, t, addr)
             elif q == b"find_node":
@@ -713,10 +718,10 @@ class DHTDiscovery(PeerDiscovery):
                 self._handle_get_peers_query(a, t, addr)
             elif q == b"announce_peer":
                 self._handle_announce_peer_query(a, t, addr)
-                
+
         except Exception as e:
             self.logger.error("Error handling DHT query from %s: %s", addr, e)
-            
+
     def _handle_error(self, message: dict, addr: Tuple[str, int]):
         """Handle DHT error message"""
         try:
@@ -724,28 +729,24 @@ class DHTDiscovery(PeerDiscovery):
             if len(e) >= 2:
                 error_code = e[0]
                 error_msg = e[1]
-                self.logger.warning("DHT error from %s: %d - %s", addr, error_code, error_msg)
-                
+                self.logger.warning(
+                    "DHT error from %s: %d - %s", addr, error_code, error_msg
+                )
+
         except Exception as e:
             self.logger.error("Error handling DHT error from %s: %s", addr, e)
-            
+
     def _handle_ping_query(self, a: dict, t: bytes, addr: Tuple[str, int]):
         """Handle ping query"""
         try:
             # Send ping response
-            response = {
-                b"t": t,
-                b"y": b"r",
-                b"r": {
-                    b"id": self.dht_id
-                }
-            }
-            
+            response = {b"t": t, b"y": b"r", b"r": {b"id": self.dht_id}}
+
             self._send_message(response, addr)
-            
+
         except Exception as e:
             self.logger.error("Error handling ping query: %s", e)
-            
+
     def _handle_find_node_query(self, a: dict, t: bytes, addr: Tuple[str, int]):
         """Handle find_node query"""
         try:
@@ -755,32 +756,29 @@ class DHTDiscovery(PeerDiscovery):
                 b"y": b"r",
                 b"r": {
                     b"id": self.dht_id,
-                    b"nodes": self._get_closest_nodes(a.get(b"target", b""))
-                }
+                    b"nodes": self._get_closest_nodes(a.get(b"target", b"")),
+                },
             }
-            
+
             self._send_message(response, addr)
-            
+
         except Exception as e:
             self.logger.error("Error handling find_node query: %s", e)
-            
+
     def _handle_get_peers_query(self, a: dict, t: bytes, addr: Tuple[str, int]):
         """Handle get_peers query"""
         try:
             info_hash = a.get(b"info_hash", b"")
-            
+
             # Check if we have peers for this info_hash
             peers = self._get_peers_for_info_hash(info_hash)
-            
+
             if peers:
                 # We have peers, return them
                 response = {
                     b"t": t,
                     b"y": b"r",
-                    b"r": {
-                        b"id": self.dht_id,
-                        b"values": peers
-                    }
+                    b"r": {b"id": self.dht_id, b"values": peers},
                 }
             else:
                 # No peers, return closest nodes
@@ -790,77 +788,73 @@ class DHTDiscovery(PeerDiscovery):
                     b"r": {
                         b"id": self.dht_id,
                         b"nodes": self._get_closest_nodes(info_hash),
-                        b"token": self._generate_token(addr)
-                    }
+                        b"token": self._generate_token(addr),
+                    },
                 }
-                
+
             self._send_message(response, addr)
-            
+
         except Exception as e:
             self.logger.error("Error handling get_peers query: %s", e)
-            
+
     def _handle_announce_peer_query(self, a: dict, t: bytes, addr: Tuple[str, int]):
         """Handle announce_peer query"""
         try:
             info_hash = a.get(b"info_hash", b"")
             token = a.get(b"token", b"")
             port = a.get(b"port", 0)
-            
+
             # Validate token
             if not self._validate_token(token, addr):
                 self.logger.warning("Invalid token from %s for announce_peer", addr)
                 return
-                
+
             # Add the peer to our list
             peer_ip = addr[0]
             if b"implied_port" in a and a[b"implied_port"] == 1:
                 peer_port = addr[1]
             else:
                 peer_port = port
-                
+
             with self.lock:
                 peer = (peer_ip, peer_port)
                 if peer not in self.peers:
                     self.peers.append(peer)
-                    self.logger.info("Discovered peer via DHT announce: %s:%d", peer_ip, peer_port)
-                    
+                    self.logger.info(
+                        "Discovered peer via DHT announce: %s:%d", peer_ip, peer_port
+                    )
+
             # Send response
-            response = {
-                b"t": t,
-                b"y": b"r",
-                b"r": {
-                    b"id": self.dht_id
-                }
-            }
-            
+            response = {b"t": t, b"y": b"r", b"r": {b"id": self.dht_id}}
+
             self._send_message(response, addr)
-            
+
         except Exception as e:
             self.logger.error("Error handling announce_peer query: %s", e)
-            
+
     def _handle_ping_response(self, message: dict, addr: Tuple[str, int]):
         """Handle ping response"""
         # Add node to our routing table
         self._add_node(addr)
         self._send_get_peers(addr, self.torrent.info_hash)
-        
+
     def _handle_find_node_response(self, message: dict, addr: Tuple[str, int]):
         """Handle find_node response"""
         try:
             r = message.get(b"r", {})
             nodes = r.get(b"nodes", b"")
-            
+
             # Add nodes to our routing table
             self._add_nodes_from_compact(nodes)
-            
+
         except Exception as e:
             self.logger.error("Error handling find_node response: %s", e)
-            
+
     def _handle_get_peers_response(self, message: dict, addr: Tuple[str, int]):
         """Handle get_peers response"""
         try:
             r = message.get(b"r", {})
-            
+
             if b"values" in r:
                 # Response contains peers
                 values = r[b"values"]
@@ -873,46 +867,41 @@ class DHTDiscovery(PeerDiscovery):
                                 peer_addr = (ip, port)
                                 if peer_addr not in self.peers:
                                     self.peers.append(peer_addr)
-                                    self.logger.info("Discovered peer via DHT: %s:%d", ip, port)
+                                    self.logger.info(
+                                        "Discovered peer via DHT: %s:%d", ip, port
+                                    )
             elif b"nodes" in r:
                 # Response contains nodes
                 nodes = r[b"nodes"]
                 self._add_nodes_from_compact(nodes)
-                
+
         except Exception as e:
             self.logger.error("Error handling get_peers response: %s", e)
-            
+
     def _handle_announce_peer_response(self, message: dict, addr: Tuple[str, int]):
         """Handle announce_peer response"""
         # Nothing to do for now
         pass
-        
+
     def _bootstrap(self):
         """Bootstrap the DHT by pinging initial nodes"""
         self.logger.info("Bootstrapping with %d nodes", len(self.nodes))
         for node in self.nodes:
             self._send_ping(node)
-            
+
     def _send_ping(self, node: Tuple[str, int]):
         """Send ping to a DHT node"""
         try:
             t = self._generate_transaction_id()
-            message = {
-                b"t": t,
-                b"y": b"q",
-                b"q": b"ping",
-                b"a": {
-                    b"id": self.dht_id
-                }
-            }
-            
+            message = {b"t": t, b"y": b"q", b"q": b"ping", b"a": {b"id": self.dht_id}}
+
             self.transactions[t] = {"type": "ping", "node": node}
             self._send_message(message, node)
             self.logger.info("Sent ping to %s", node)
-            
+
         except Exception as e:
             self.logger.error("Error sending ping to %s: %s", node, e)
-            
+
     def _send_find_node(self, node: Tuple[str, int], target: bytes):
         """Send find_node to a DHT node"""
         try:
@@ -921,18 +910,15 @@ class DHTDiscovery(PeerDiscovery):
                 b"t": t,
                 b"y": b"q",
                 b"q": b"find_node",
-                b"a": {
-                    b"id": self.dht_id,
-                    b"target": target
-                }
+                b"a": {b"id": self.dht_id, b"target": target},
             }
-            
+
             self.transactions[t] = {"type": "find_node", "node": node, "target": target}
             self._send_message(message, node)
-            
+
         except Exception as e:
             self.logger.error("Error sending find_node to %s: %s", node, e)
-            
+
     def _send_get_peers(self, node: Tuple[str, int], info_hash: bytes):
         """Send get_peers to a DHT node"""
         try:
@@ -941,19 +927,22 @@ class DHTDiscovery(PeerDiscovery):
                 b"t": t,
                 b"y": b"q",
                 b"q": b"get_peers",
-                b"a": {
-                    b"id": self.dht_id,
-                    b"info_hash": info_hash
-                }
+                b"a": {b"id": self.dht_id, b"info_hash": info_hash},
             }
-            
-            self.transactions[t] = {"type": "get_peers", "node": node, "info_hash": info_hash}
+
+            self.transactions[t] = {
+                "type": "get_peers",
+                "node": node,
+                "info_hash": info_hash,
+            }
             self._send_message(message, node)
-            
+
         except Exception as e:
             self.logger.error("Error sending get_peers to %s: %s", node, e)
-            
-    def _send_announce_peer(self, node: Tuple[str, int], info_hash: bytes, token: bytes):
+
+    def _send_announce_peer(
+        self, node: Tuple[str, int], info_hash: bytes, token: bytes
+    ):
         """Send announce_peer to a DHT node"""
         try:
             t = self._generate_transaction_id()
@@ -965,16 +954,20 @@ class DHTDiscovery(PeerDiscovery):
                     b"id": self.dht_id,
                     b"info_hash": info_hash,
                     b"port": self.port,
-                    b"token": token
-                }
+                    b"token": token,
+                },
             }
-            
-            self.transactions[t] = {"type": "announce_peer", "node": node, "info_hash": info_hash}
+
+            self.transactions[t] = {
+                "type": "announce_peer",
+                "node": node,
+                "info_hash": info_hash,
+            }
             self._send_message(message, node)
-            
+
         except Exception as e:
             self.logger.error("Error sending announce_peer to %s: %s", node, e)
-            
+
     def _send_message(self, message: dict, addr: Tuple[str, int]):
         """Send a DHT message to an address"""
         try:
@@ -982,50 +975,50 @@ class DHTDiscovery(PeerDiscovery):
             self.socket.sendto(encoded, addr)
         except Exception as e:
             self.logger.error("Error sending message to %s: %s", addr, e)
-            
+
     def _generate_transaction_id(self) -> bytes:
         """Generate a random transaction ID"""
         return os.urandom(2)
-        
+
     def _generate_node_id(self) -> bytes:
         return os.urandom(20)
-        
+
     def _generate_token(self, addr: Tuple[str, int]) -> bytes:
         """Generate a token for announce_peer validation"""
         # Simple token generation based on IP and timestamp
         # In a real implementation, this should be more secure
         token_data = f"{addr[0]}:{time.time()}".encode()
         return hashlib.sha1(token_data).digest()[:8]
-        
+
     def _validate_token(self, token: bytes, addr: Tuple[str, int]) -> bool:
         """Validate an announce_peer token"""
         # Simple validation - in a real implementation, this should be more secure
         expected_token = self._generate_token(addr)
         return token == expected_token
-        
+
     def _add_node(self, addr: Tuple[str, int]):
         """Add a node to our routing table"""
         if addr not in self.nodes:
             self.logger.info("Added %s to the DHT routing table", addr)
             self.nodes.append(addr)
-            
+
     def _add_nodes_from_compact(self, nodes: bytes):
         """Add nodes from compact node info format"""
         try:
             for i in range(0, len(nodes), 26):
                 if i + 26 > len(nodes):
                     break
-                    
-                node_info = nodes[i:i+26]
+
+                node_info = nodes[i : i + 26]
                 node_id = node_info[:20]
                 ip = socket.inet_ntoa(node_info[20:24])
                 port = struct.unpack("!H", node_info[24:26])[0]
-                
+
                 self._add_node((ip, port))
-                
+
         except Exception as e:
             self.logger.error("Error adding nodes from compact format: %s", e)
-            
+
     def _get_closest_nodes(self, target: bytes) -> bytes:
         """Get closest nodes to target in compact format"""
         # Simple implementation - return all known nodes
@@ -1040,13 +1033,13 @@ class DHTDiscovery(PeerDiscovery):
                 nodes += node_id + ip_bytes + port_bytes
             except:
                 continue
-                
+
         return nodes
-        
+
     def _get_peers_for_info_hash(self, info_hash: bytes) -> List[bytes]:
         """Get peers for a given info_hash in compact format"""
         peers = []
-        
+
         # Check if this is our torrent
         if info_hash == self.torrent.info_hash:
             # Add ourselves as a peer
@@ -1057,32 +1050,53 @@ class DHTDiscovery(PeerDiscovery):
                 s.connect(("8.8.8.8", 80))
                 our_ip = s.getsockname()[0]
                 s.close()
-                
+
                 peer = socket.inet_aton(our_ip) + self.port.to_bytes(2, "big")
                 peers.append(peer)
             except:
                 pass
-                
+
         return peers
+
 
 @logged
 class SubnetScannerDriver(PeerDiscovery):
-    """Aggressive subnet scanner that discovers peers by scanning local network"""
+    """Efficient subnet scanner using ICMP for host discovery followed by targeted port scanning"""
 
     # Common BitTorrent ports to scan
-    COMMON_PORTS = [6881, 6882, 6883, 6884, 6885, 6886, 6887, 6888, 6889, 6890,
-                    6969, 6999, 8999, 9999, 10000, 10001]
+    COMMON_PORTS = [
+        6881,
+        6882,
+        6883,
+        6884,
+        6885,
+        6886,
+        6887,
+        6888,
+        6889,
+        6890,
+        6969,
+        6999,
+        8999,
+        9999,
+        10000,
+        10001,
+    ]
 
-    # Maximum number of concurrent connection attempts
-    MAX_WORKERS = 50
-
-    # Scan configuration
+    # Configuration
+    MAX_WORKERS = 6553  # powerful...
     SCAN_INTERVAL = 300  # 5 minutes between full scans
-    CONNECTION_TIMEOUT = 0.001 # ha-hayai!
+    ICMP_TIMEOUT = 1  # ICMP response timeout
+    CONNECTION_TIMEOUT = 0.1  # TCP connection timeout
 
-    def __init__(self, torrent, peer_id, port=6881,
-                 subnet_cidr: str = None,
-                 custom_ports: List[int] = None):
+    def __init__(
+        self,
+        torrent,
+        peer_id,
+        port=6881,
+        subnet_cidrs: str = None,
+        custom_ports: List[int] = None,
+    ):
         self.torrent = torrent
         self.peer_id = peer_id
         self.port = port
@@ -1091,68 +1105,390 @@ class SubnetScannerDriver(PeerDiscovery):
         self.running = False
         self.scan_thread = None
         self.initialized = False
+        self.use_icmp = True
 
         # Network configuration
-        self.subnet_cidr = subnet_cidr or self._detect_local_subnet()
+        self.subnet_cidrs = subnet_cidrs or self._detect_local_subnets()
+        if len(self.subnet_cidrs) > 3:
+            self.logger.warning(
+                f"Too many subnets ({self.subnet_cidrs}). Manually specify the subnets the client should connect to"
+            )
+            self.subnet_cidrs = [
+                "192.168.43.130",
+            ]
         self.ports_to_scan = custom_ports or self.COMMON_PORTS
+
+        # Host discovery results
+        self.active_hosts: Set[str] = set()
 
         # Statistics
         self.scan_attempts = 0
         self.successful_discoveries = 0
         self.last_scan_time = 0
 
-        self.logger.info(f"SubnetScanner initialized for subnet: {self.subnet_cidr}")
+        self.logger.info(
+            f"ICMP SubnetScanner initialized for subnet(s): {self.subnet_cidrs}"
+        )
 
-    def _detect_local_subnet(self) -> str:
-        """Detect the local subnet automatically"""
+    def _detect_local_subnets(self) -> List[str]:
+        """Use ip command to get all subnets"""
+        subnets = set()
+
         try:
-            # Try to connect to a remote host to determine our interface
+            # Get IPv4 routes
+            result = subprocess.run(
+                ["ip", "-4", "route", "show"], capture_output=True, text=True, timeout=5
+            )
+
+            if result.returncode == 0:
+                for line in result.stdout.split("\n"):
+                    line = line.strip()
+                    # Look for lines with subnet notation
+                    if "scope link" in line or "dev" in line:
+                        # Extract subnet pattern (x.x.x.x/y)
+                        match = re.search(r"(\d+\.\d+\.\d+\.\d+/\d+)", line)
+                        if match:
+                            subnet = match.group(1)
+                            try:
+                                # Validate it's a proper network
+                                network = ipaddress.IPv4Network(subnet, strict=False)
+                                # Skip very large networks that aren't useful for scanning
+                                if network.prefixlen >= 16 and not network.is_loopback:
+                                    subnets.add(str(network))
+                            except (ValueError, ipaddress.NetmaskValueError):
+                                continue
+
+            # Get interface information
+            result = subprocess.run(
+                ["ip", "-4", "addr", "show"], capture_output=True, text=True, timeout=5
+            )
+
+            if result.returncode == 0:
+                current_interface = None
+                for line in result.stdout.split("\n"):
+                    line = line.strip()
+                    # Interface line
+                    if line and not line.startswith(" "):
+                        current_interface = (
+                            line.split(":")[1].strip() if ":" in line else None
+                        )
+                    # Inet line with CIDR
+                    elif "inet " in line:
+                        match = re.search(r"inet (\d+\.\d+\.\d+\.\d+/\d+)", line)
+                        if match and current_interface and current_interface != "lo":
+                            subnet = match.group(1)
+                            try:
+                                network = ipaddress.IPv4Network(subnet, strict=False)
+                                if not network.is_loopback:
+                                    subnets.add(str(network))
+                            except (ValueError, ipaddress.NetmaskValueError):
+                                continue
+
+        except (
+            subprocess.TimeoutExpired,
+            subprocess.SubprocessError,
+            FileNotFoundError,
+        ) as e:
+            self.logger.debug(f"Error running ip command: {e}")
+
+        return list(subnets)
+
+    def _detect_local_subnets_fallback(self) -> str:
+        """Detect the subnet of the interface acting as a gateway (heuristic)"""
+        try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 s.connect(("8.8.8.8", 80))
                 local_ip = s.getsockname()[0]
 
-            # Common subnet masks based on private IP ranges
-            if local_ip.startswith('10.'):
-                return '10.0.0.0/8'
-            elif local_ip.startswith('172.16.'):
-                return '172.16.0.0/12'
-            elif local_ip.startswith('192.168.'):
-                return '192.168.0.0/16'
-            elif local_ip.startswith('169.254.'):
-                return '169.254.0.0/16'  # Link-local
+            if local_ip.startswith("10."):
+                return [
+                    "10.0.0.0/8",
+                ]
+            elif local_ip.startswith("172.16."):
+                return [
+                    "172.16.0.0/12",
+                ]
+            elif local_ip.startswith("192.168."):
+                return [
+                    "192.168.0.0/16",
+                ]
+            elif local_ip.startswith("169.254."):
+                return [
+                    "169.254.0.0/16",
+                ]
             else:
-                # Assume /24 for other private IPs
-                ip_parts = local_ip.split('.')
-                return f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.0/24"
+                ip_parts = local_ip.split(".")
+                return [f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.0/24"]
 
         except Exception as e:
             self.logger.warning(f"Failed to detect local subnet: {e}")
-            return '192.168.1.0/24'  # Fallback to common home network
+            return [
+                "192.168.1.0/24",
+            ]
+
+    def _create_icmp_socket(self):
+        """Create raw socket for ICMP (requires root privileges on most systems)"""
+        try:
+            # Try to create raw ICMP socket
+            return socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        except PermissionError:
+            self.logger.warning(
+                "Raw ICMP socket requires root privileges. Falling back to alternative method."
+            )
+            return None
+
+    def _send_icmp_echo(
+        self, sock: socket.socket, dest_addr: str, icmp_id: int, seq: int
+    ) -> bool:
+        """Send ICMP echo request to destination"""
+        # no error handling
+        # we send way to many of these
+        # Create ICMP header
+        checksum = 0
+        header = struct.pack("!BBHHH", 8, 0, checksum, icmp_id, seq)
+
+        # Calculate checksum
+        checksum = self._calculate_checksum(header)
+        header = struct.pack("!BBHHH", 8, 0, checksum, icmp_id, seq)
+
+        # Send packet
+        try:
+            sock.sendto(header, (dest_addr, 0))
+        except:
+            # be happy
+            pass
+
+    def _calculate_checksum(self, data: bytes) -> int:
+        """Calculate ICMP checksum"""
+        if len(data) % 2:
+            data += b"\x00"
+
+        checksum = 0
+        for i in range(0, len(data), 2):
+            word = (data[i] << 8) + data[i + 1]
+            checksum += word
+
+        checksum = (checksum >> 16) + (checksum & 0xFFFF)
+        checksum = ~checksum & 0xFFFF
+        return checksum
+
+    def _discover_active_hosts_icmp(self) -> Set[str]:
+        """Discover active hosts in subnet using ICMP echo requests"""
+        active_hosts = set()
+        hosts_to_ping = []
+        for subnet_cidr in self.subnet_cidrs:
+            network = ipaddress.ip_network(subnet_cidr, strict=False)
+
+            # Generate all host IPs in subnet
+            hosts_to_ping.extend((str(host) for host in network.hosts()))
+
+        if not self.use_icmp:
+            return hosts_to_ping
+
+        try:
+            sock = self._create_icmp_socket()
+            if sock is None:
+                # return all
+                return hosts_to_ping
+
+            sock.settimeout(self.ICMP_TIMEOUT)
+            icmp_id = os.getpid() & 0xFFFF
+
+            self.logger.info(
+                f"Sending ICMP echo requests to {len(hosts_to_ping)} hosts"
+            )
+
+            # Send all ICMP echo requests first
+            for seq, host in enumerate(hosts_to_ping):
+                # we don't care about the result
+                threading.Thread(
+                    target=self._send_icmp_echo,
+                    # seq can be >= 65535
+                    # so it might not fit
+                    args=(sock, host, icmp_id, seq % 65535),
+                    daemon=True,
+                ).start()
+
+            # Listen for responses
+            start_time = time.time()
+            while time.time() - start_time < self.ICMP_TIMEOUT * 10:
+                ready = select.select([sock], [], [], 0.1)
+                if ready[0]:
+                    try:
+                        packet, addr = sock.recvfrom(1024)
+                        ip_header = packet[:20]
+                        ip_src = socket.inet_ntoa(ip_header[12:16])
+
+                        # Check if this is an ICMP echo reply
+                        if len(packet) >= 28:
+                            icmp_header = packet[20:28]
+                            icmp_type, code, checksum, pkt_id, seq = struct.unpack(
+                                "!BBHHH", icmp_header
+                            )
+
+                            if icmp_type == 0 and code == 0 and pkt_id == icmp_id:
+                                active_hosts.add(ip_src)
+                    except socket.timeout:
+                        break
+                    except Exception as e:
+                        self.logger.debug(f"Error reading ICMP response: {e}")
+
+            sock.close()
+
+        except Exception as e:
+            self.logger.error(f"ICMP discovery failed: {e}")
+            active_hosts = []
+
+        self.logger.info(f"ICMP discovery found {len(active_hosts)} active hosts")
+        return active_hosts
+
+    def _scan_ports_on_active_hosts(
+        self, active_hosts: Set[str]
+    ) -> List[Tuple[str, int]]:
+        """Scan common ports on active hosts discovered via ICMP"""
+        discovered_peers = []
+
+        self.logger.info(
+            f"Scanning {len(self.ports_to_scan)} ports on {len(active_hosts)} active hosts"
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.MAX_WORKERS
+        ) as executor:
+            # Submit all port scanning tasks
+            future_to_target = {}
+            for host in active_hosts:
+                for port in self.ports_to_scan:
+                    future = executor.submit(self._check_host_port, host, port)
+                    future_to_target[future] = (host, port)
+
+            # Collect results
+            for future in concurrent.futures.as_completed(future_to_target):
+                if not self.running:
+                    break
+
+                target = future_to_target[future]
+                try:
+                    if result := future.result():
+                        ip, port = result
+                        discovered_peers.append((ip, port))
+                        self._add_peer(ip, port)
+                except Exception as e:
+                    self.logger.debug(f"Port scan failed for {target}: {e}")
+
+        return discovered_peers
+
+    def _check_host_port(self, ip: str, port: int) -> Tuple[str, int]:
+        """Check if a specific host:port is a BitTorrent peer"""
+        self.scan_attempts += 1
+
+        try:
+            # Skip localhost and our own IP
+            if ip in ["127.0.0.1", "localhost", "0.0.0.0"]:
+                return None
+
+            # Create socket with timeout
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(self.CONNECTION_TIMEOUT)
+
+                # Attempt connection
+                result = sock.connect_ex((ip, port))
+
+                if result == 0:
+                    # Connection successful - verify it's a BitTorrent peer
+                    if self._verify_bittorrent_peer(sock, ip, port):
+                        self.logger.info(f"Verified BitTorrent peer: {ip}:{port}")
+                        return (ip, port)
+                    else:
+                        self.logger.debug(f"Port {ip}:{port} open but not BitTorrent")
+
+        except (socket.timeout, ConnectionRefusedError, OSError):
+            pass  # Expected for most hosts/ports
+        except Exception as e:
+            self.logger.debug(f"Error checking {ip}:{port}: {e}")
+
+        return None
+
+    def _verify_bittorrent_peer(self, sock: socket.socket, ip: str, port: int) -> bool:
+        """Perform a quick verification to check if this is a BitTorrent peer"""
+        try:
+            # Send handshake
+            handshake = self._create_handshake()
+            sock.sendall(handshake)
+
+            # Read response with timeout
+            response = sock.recv(68)  # Handshake response length
+
+            if len(response) >= 68:
+                # Verify handshake response structure
+                return (
+                    response[0] == 19
+                    and response[1:20] == b"BitTorrent protocol"
+                    and response[28:48] == self.torrent.info_hash
+                )
+
+        except (socket.timeout, ConnectionResetError, BrokenPipeError):
+            pass  # Not a BitTorrent peer or connection failed
+        except Exception as e:
+            self.logger.debug(f"Handshake failed for {ip}:{port}: {e}")
+
+        return False
+
+    def _create_handshake(self) -> bytes:
+        """Create a BitTorrent handshake message"""
+        protocol = b"BitTorrent protocol"
+        reserved = b"\x00" * 8
+        handshake = (
+            bytes([len(protocol)])
+            + protocol
+            + reserved
+            + self.torrent.info_hash
+            + self.peer_id
+        )
+        return handshake
+
+    def _perform_scan(self):
+        """Perform efficient subnet scan using ICMP discovery first"""
+        try:
+            self.logger.info(f"Starting efficient subnet scan: {self.subnet_cidrs}")
+            start_time = time.time()
+
+            # Phase 1: ICMP host discovery
+            active_hosts = self._discover_active_hosts_icmp()
+
+            # Phase 2: Targeted port scanning on active hosts
+            discovered_peers = self._scan_ports_on_active_hosts(active_hosts)
+
+            scan_duration = time.time() - start_time
+            self.last_scan_time = time.time()
+            self.scan_attempts += 1
+
+            self.logger.info(
+                f"Efficient scan completed in {scan_duration:.2f}s. "
+                f"Found {len(discovered_peers)} new peers from {len(active_hosts)} active hosts"
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error during subnet scan: {e}")
 
     def initialize(self) -> bool:
         """Initialize the subnet scanner"""
-        try:
-            # Validate the subnet
-            network = ipaddress.ip_network(self.subnet_cidr, strict=False)
-            num_hosts = network.num_addresses - 2  # Exclude network and broadcast
-
-            if num_hosts > 65536:  # Limit to reasonable size
-                self.logger.warning(f"Subnet {self.subnet_cidr} is too large, limiting scan")
-                return False
-
-            self.initialized = True
-            self.logger.info(f"SubnetScanner initialized for {self.subnet_cidr} "
-                           f"({num_hosts} hosts, {len(self.ports_to_scan)} ports)")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Failed to initialize SubnetScanner: {e}")
-            return False
+        # :D
+        self.initialized = True
+        return True
 
     def get_peers(self) -> List[Tuple[str, int]]:
         """Get the current list of discovered peers"""
         with self.lock:
             return self.peers.copy()
+
+    def _add_peer(self, ip: str, port: int):
+        """Add a discovered peer to the list"""
+        with self.lock:
+            peer = (ip, port)
+            if peer not in self.peers:
+                self.peers.append(peer)
+                self.successful_discoveries += 1
 
     def cleanup(self):
         """Clean up scanner resources"""
@@ -1182,181 +1518,48 @@ class SubnetScannerDriver(PeerDiscovery):
             self.scan_thread = None
         self.logger.info("SubnetScanner discovery stopped")
 
-    def update_stats(self, downloaded: int, uploaded: int, left: int):
-        """Update statistics - scanner doesn't use torrent stats"""
-        pass
-
     def _scan_loop(self):
         """Main scanning loop"""
-        # Run initial scan immediately
         self._perform_scan()
-
-        # Then scan at regular intervals
         while self.running:
             time.sleep(self.SCAN_INTERVAL)
             if self.running:
                 self._perform_scan()
 
-    def _perform_scan(self):
-        """Perform a full subnet scan"""
-        try:
-            self.logger.info(f"Starting subnet scan: {self.subnet_cidr}")
-            start_time = time.time()
-
-            network = ipaddress.ip_network(self.subnet_cidr, strict=False)
-            hosts_to_scan = list(network.hosts())
-
-            self.logger.info(f"Scanning {len(hosts_to_scan)} hosts on {len(self.ports_to_scan)} ports")
-
-            # Use thread pool for concurrent scanning
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=self.MAX_WORKERS,
-                thread_name_prefix="subnet_scanner"
-            ) as executor:
-                # Submit all scan tasks
-                future_to_target = {
-                    executor.submit(self._check_host_port, str(host), port): (str(host), port)
-                    for host in hosts_to_scan
-                    for port in self.ports_to_scan
-                }
-
-                # Process results as they complete
-                for future in concurrent.futures.as_completed(future_to_target):
-                    if not self.running:
-                        break
-
-                    target = future_to_target[future]
-                    try:
-                        result = future.result()
-                        if result:
-                            ip, port = result
-                            self._add_peer(ip, port)
-                    except Exception as e:
-                        self.logger.debug(f"Scan task failed for {target}: {e}")
-
-            scan_duration = time.time() - start_time
-            self.last_scan_time = time.time()
-            self.scan_attempts += 1
-
-            self.logger.info(f"Scan completed in {scan_duration:.2f}s. "
-                           f"Found {self.successful_discoveries} peers total")
-
-        except Exception as e:
-            self.logger.error(f"Error during subnet scan: {e}")
-
-    def _check_host_port(self, ip: str, port: int) -> Tuple[str, int]:
-        """Check if a specific host:port is a BitTorrent peer"""
-        self.scan_attempts += 1
-
-        try:
-            # Skip localhost and our own IP
-            if ip in ['127.0.0.1', 'localhost', '0.0.0.0']:
-                return None
-
-            # Create socket with timeout
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(self.CONNECTION_TIMEOUT)
-
-                # Attempt connection
-                result = sock.connect_ex((ip, port))
-                print((ip, port))
-
-                if result == 0:
-                    # Connection successful - this might be a BitTorrent peer
-                    self.logger.debug(f"Found open port {ip}:{port}")
-
-                    # Try to perform a quick handshake to verify it's a BitTorrent peer
-                    if self._verify_bittorrent_peer(ip, port):
-                        self.logger.info(f"Verified BitTorrent peer: {ip}:{port}")
-                        return (ip, port)
-                    else:
-                        self.logger.debug(f"Port {ip}:{port} open but not BitTorrent")
-
-        except socket.timeout:
-            pass  # Expected for most hosts
-        except ConnectionRefusedError:
-            pass  # Expected for closed ports
-        except Exception as e:
-            self.logger.debug(f"Error checking {ip}:{port}: {e}")
-
-        return None
-
-    def _verify_bittorrent_peer(self, ip: str, port: int) -> bool:
-        """Perform a quick verification to check if this is a BitTorrent peer"""
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(3)  # Shorter timeout for verification
-
-                # Connect and send handshake
-                sock.connect((ip, port))
-
-                # Send handshake
-                handshake = self._create_handshake()
-                sock.send(handshake)
-
-                # Wait for response (partial is enough)
-                sock.settimeout(1)
-                response = sock.recv(1)  # Just check if we get any response
-
-                # If we get any response, it's likely a BitTorrent peer
-                return len(response) > 0
-
-        except Exception as e:
-            self.logger.debug(f"Peer verification failed for {ip}:{port}: {e}")
-            return False
-
-    def _create_handshake(self) -> bytes:
-        """Create a BitTorrent handshake message"""
-        # NOTE duplicate code
-        return (
-            b"\x13BitTorrent protocol" +
-            b"\x00" * 8 +
-            self.torrent.info_hash +
-            self.peer_id
-        )
-
-    def _add_peer(self, ip: str, port: int):
-        """Add a discovered peer to the list"""
-        with self.lock:
-            peer = (ip, port)
-            if peer not in self.peers:
-                self.peers.append(peer)
-                self.successful_discoveries += 1
-                self.logger.info(f"Discovered peer via subnet scan: {ip}:{port}")
+    def update_stats(self, downloaded: int, uploaded: int, left: int):
+        """Update statistics - scanner doesn't use torrent stats"""
+        pass
 
     def get_scan_stats(self) -> dict:
         """Get scanning statistics"""
-        with self.lock:
-            return {
-                'subnet': self.subnet_cidr,
-                'total_peers': len(self.peers),
-                'scan_attempts': self.scan_attempts,
-                'successful_discoveries': self.successful_discoveries,
-                'last_scan_time': self.last_scan_time,
-                'ports_scanned': len(self.ports_to_scan),
-                'is_running': self.running
-            }
+        return {
+            "scan_attempts": self.scan_attempts,
+            "successful_discoveries": self.successful_discoveries,
+            "last_scan_time": self.last_scan_time,
+            "active_hosts_count": len(self.active_hosts),
+            "current_peers_count": len(self.peers),
+        }
 
     def set_subnet(self, subnet_cidr: str):
         """Update the subnet to scan"""
-        try:
-            network = ipaddress.ip_network(subnet_cidr, strict=False)
+        with self.lock:
             self.subnet_cidr = subnet_cidr
             self.logger.info(f"Updated scan subnet to: {subnet_cidr}")
-        except Exception as e:
-            self.logger.error(f"Invalid subnet {subnet_cidr}: {e}")
 
     def add_custom_port(self, port: int):
         """Add a custom port to scan"""
-        if port not in self.ports_to_scan:
-            self.ports_to_scan.append(port)
-            self.logger.info(f"Added custom port to scan: {port}")
+        with self.lock:
+            if port not in self.ports_to_scan:
+                self.ports_to_scan.append(port)
+                self.logger.info(f"Added custom port: {port}")
 
     def remove_custom_port(self, port: int):
         """Remove a port from scanning"""
-        if port in self.ports_to_scan:
-            self.ports_to_scan.remove(port)
-            self.logger.info(f"Removed port from scan: {port}")
+        with self.lock:
+            if port in self.ports_to_scan:
+                self.ports_to_scan.remove(port)
+                self.logger.info(f"Removed port: {port}")
+
 
 @logged
 class SmartSubnetScannerDriver(SubnetScannerDriver):
@@ -1393,7 +1596,9 @@ class SmartSubnetScannerDriver(SubnetScannerDriver):
 
         # Focus on IPs near previously found peers
         target_ips = self._generate_target_ips()
-        target_ports = list(self.learned_ports) if self.learned_ports else self.ports_to_scan
+        target_ports = (
+            list(self.learned_ports) if self.learned_ports else self.ports_to_scan
+        )
 
         self._scan_targets(target_ips, target_ports)
 
@@ -1479,8 +1684,10 @@ class SmartSubnetScannerDriver(SubnetScannerDriver):
             self.scan_strategy = "conservative"
             self.current_scan_interval = self.max_scan_interval
 
-        self.logger.debug(f"Adjusted strategy to {self.scan_strategy}, "
-                         f"interval: {self.current_scan_interval}s")
+        self.logger.debug(
+            f"Adjusted strategy to {self.scan_strategy}, "
+            f"interval: {self.current_scan_interval}s"
+        )
 
     def _scan_loop(self):
         """Smart scanning loop with adaptive intervals"""
@@ -1509,16 +1716,21 @@ class SmartSubnetScannerDriver(SubnetScannerDriver):
     def get_scan_stats(self) -> dict:
         """Get enhanced scanning statistics"""
         base_stats = super().get_scan_stats()
-        base_stats.update({
-            'scan_strategy': self.scan_strategy,
-            'learned_ports': len(self.learned_ports),
-            'active_peers': len(self.active_peers),
-            'failed_hosts': len(self.failed_hosts),
-            'current_interval': self.current_scan_interval
-        })
+        base_stats.update(
+            {
+                "scan_strategy": self.scan_strategy,
+                "learned_ports": len(self.learned_ports),
+                "active_peers": len(self.active_peers),
+                "failed_hosts": len(self.failed_hosts),
+                "current_interval": self.current_scan_interval,
+            }
+        )
         return base_stats
 
-#DRIVERS = [TrackerDriver, LocalPeerDiscoveryDriver, SmartSubnetScannerDriver]
-DRIVERS = [DHTDiscovery,]
-#DRIVERS = [LocalPeerDiscoveryDriver,]
-#DRIVERS = [SmartSubnetScannerDriver,]
+
+# DRIVERS = [TrackerDriver, LocalPeerDiscoveryDriver, SmartSubnetScannerDriver]
+# DRIVERS = [DHTDiscovery,]
+# DRIVERS = [LocalPeerDiscoveryDriver,]
+DRIVERS = [
+    SmartSubnetScannerDriver,
+]

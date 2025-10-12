@@ -9,7 +9,13 @@ import socket
 from filesystem import TorrentFile
 from peer_drivers import DRIVERS
 from middleware import PieceManager
-from network.connection import ConnectionManager, PeerServer, PortManager, ActiveConnection, PassiveConnection
+from network.connection import (
+    ConnectionManager,
+    PeerServer,
+    PortManager,
+    ActiveConnection,
+    PassiveConnection,
+)
 from stats import Statistics
 from log import logged
 
@@ -197,7 +203,7 @@ class BitTorrentClient:
         if not self.piece_manager.is_complete():
             self.logger.warning("Cannot transition to seeding: download not complete")
             return
-        
+
         self.connection_manager.close_all()
         # less seeding connections
         self.connection_manager.max_connections = 20
