@@ -7,30 +7,31 @@ import time
 
 from log import logged
 
+
 @logged
 class PeerWireProtocol:
     """
     Implements the BitTorrent peer wire protocol for communication between peers.
-    
+
     This class handles both incoming and outgoing connections, message serialization/deserialization,
     and maintains the state of the connection with a peer.
-    
+
     Key functionalities:
     - Establishing connections (both outgoing and incoming)
     - Handshake negotiation
     - Message sending and receiving
     - Connection management
     - Error handling and logging
-    
+
     Data flow:
     1. Connection established (either outgoing via connect() or incoming via handle_incoming_connection())
     2. Handshake exchanged to verify compatibility and info_hash
     3. Messages are exchanged using receive_message() and various send_*() methods
     4. Connection is closed via close() when done
-    
+
     The protocol follows the BitTorrent specification described in BEP 3 and related BEPs.
     """
-    
+
     # Protocol constants for message types
     CHOKE = 0
     UNCHOKE = 1
@@ -43,7 +44,7 @@ class PeerWireProtocol:
     CANCEL = 8
     PORT = 9  # For DHT support (BEP 5)
     EXTENDED = 20  # For extended messages (BEP 10)
-    
+
     # Mapping of message IDs to human-readable names
     MESSAGE_NAMES = {
         CHOKE: "CHOKE",
@@ -62,12 +63,12 @@ class PeerWireProtocol:
     def __init__(self, peer: Tuple[str, int], info_hash: bytes, peer_id: bytes):
         """
         Initialize a new PeerWireProtocol instance.
-        
+
         Args:
             peer: Tuple of (IP address, port) for the peer
             info_hash: The SHA1 hash of the torrent's info dictionary
             peer_id: Unique identifier for this client
-        
+
         Note: This constructor doesn't establish a connection. Use connect() for outgoing
         connections or handle_incoming_connection() for incoming connections.
         """
@@ -92,10 +93,10 @@ class PeerWireProtocol:
     def connect(self) -> bool:
         """
         Establish an outgoing connection to the peer.
-        
+
         Returns:
             bool: True if connection and handshake were successful, False otherwise
-        
+
         This method:
         1. Attempts to connect to the peer with a timeout
         2. Performs the BitTorrent handshake protocol
@@ -119,45 +120,48 @@ class PeerWireProtocol:
             self.logger.error(f"Failed to connect to peer {self.peer}: {e}")
             return False
 
-    def handle_incoming_connection(self, socket: socket.socket, peer: Tuple[str, int]) -> bool:
+    def handle_incoming_connection(
+        self, socket: socket.socket, peer: Tuple[str, int]
+    ) -> bool:
         """
         Handle an incoming connection from a peer.
-        
+
         Args:
             socket: The already-connected socket from the peer
             peer: Tuple of (IP address, port) for the peer
-            
+
         Returns:
             bool: True if handshake was successful, False otherwise
-        
+
         This method is used for passive peer discovery where another peer connects to us.
         It validates the handshake and prepares the protocol for message exchange.
         """
         self.socket = socket
         self.peer = peer
-        self.connected = True
-        
+
         try:
             # Perform handshake for incoming connection
             return self._handshake(is_incoming=True)
         except Exception as e:
             self.logger.error(f"Error handling incoming connection from {peer}: {e}")
             return False
-    
+        self.connected = True
+        return True
+
     def _handshake(self, is_incoming: bool = False) -> bool:
         """
         Perform the BitTorrent handshake protocol.
-        
+
         Args:
             is_incoming: True if this is an incoming connection, False for outgoing
-            
+
         Returns:
             bool: True if handshake was successful, False otherwise
-            
+
         The handshake consists of:
         1. For outgoing: Send handshake, then receive and validate response
         2. For incoming: Receive handshake, validate, then send response
-        
+
         The handshake format is:
             <pstrlen><pstr><reserved><info_hash><peer_id>
         Where:
@@ -190,7 +194,7 @@ class PeerWireProtocol:
                 raise ConnectionError("Invalid handshake response")
 
             their_peer_id = response[48:68]
-            
+
             # Check for self-connection
             if their_peer_id == self.peer_id:
                 self.logger.error(f"Detected self-connection to {self.peer}. Closing.")
@@ -213,18 +217,18 @@ class PeerWireProtocol:
     def _recv_exact(self, n: int) -> bytes:
         """
         Read exactly n bytes from the socket.
-        
+
         Args:
             n: Number of bytes to read
-            
+
         Returns:
             bytes: The read data
-            
+
         Raises:
             ConnectionError: If connection is closed before reading n bytes
             socket.timeout: If read operation times out
             Exception: For other socket errors
-            
+
         This method handles partial reads by continuing to read until exactly n bytes are received.
         """
         data = b""
@@ -243,17 +247,17 @@ class PeerWireProtocol:
     def receive_message(self) -> Tuple[Optional[int], Optional[bytes]]:
         """
         Receive a message from the peer.
-        
+
         Returns:
             Tuple of (message_id, payload) or (None, None) on error or keep-alive
-            
+
         Message format:
             <length prefix><message ID><payload>
         Where:
             length prefix: 4-byte big-endian integer indicating message length
             message ID: 1-byte message type identifier
             payload: Variable-length message data
-            
+
         Keep-alive messages have a length prefix of 0 and no message ID or payload.
         """
         # Check if connection is still active
@@ -263,7 +267,7 @@ class PeerWireProtocol:
             # Read exactly 4 bytes for the length prefix
             length_prefix = self._recv_exact(4)
             length = struct.unpack(">I", length_prefix)[0]
-            
+
             # Handle keep-alive messages
             if length == 0:
                 self.logger.debug("Received keep-alive message")
@@ -276,7 +280,7 @@ class PeerWireProtocol:
 
             # Get message name or default to UNKNOWN
             message_name = self.MESSAGE_NAMES.get(message_id, f"UNKNOWN({message_id})")
-            
+
             # Log error for unknown message types
             if message_id not in self.MESSAGE_NAMES:
                 self.logger.error(f"Received unknown message type: {message_id}")
@@ -299,14 +303,14 @@ class PeerWireProtocol:
     def send_message(self, message_id: int, payload: bytes = b"") -> bool:
         """
         Send a message to the peer.
-        
+
         Args:
             message_id: The message type identifier
             payload: The message payload data
-            
+
         Returns:
             bool: True if message was sent successfully, False otherwise
-            
+
         This is a generic method for sending all types of messages.
         Message format:
             <length prefix><message ID><payload>
@@ -314,20 +318,20 @@ class PeerWireProtocol:
         try:
             # Calculate message length (1 byte for message ID + payload length)
             length = 1 + len(payload)
-            
+
             # Pack message format: <length><message_id><payload>
             message = struct.pack(">IB", length, message_id) + payload
-            
+
             # Send the message
             self.socket.send(message)
-            
+
             # Log the message
             message_name = self.MESSAGE_NAMES.get(message_id, f"UNKNOWN({message_id})")
             if message_id not in self.MESSAGE_NAMES:
                 self.logger.error(f"Sent unknown message type: {message_id}")
             else:
                 self.logger.debug(f"Sent {message_name} message")
-                
+
             return True
         except Exception as e:
             self.logger.error(f"Failed to send message {message_id}: {e}")

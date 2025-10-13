@@ -5,6 +5,7 @@ from enum import Enum, auto
 from typing import List, Tuple, Set, Dict, Any, Optional
 import random
 import socket
+from pathlib import Path
 
 from filesystem import TorrentFile
 from peer_drivers import DRIVERS
@@ -32,6 +33,8 @@ class BitTorrentClientState(Enum):
 
 @logged
 class BitTorrentClient:
+    version = "0.0.1"
+
     def __init__(
         self,
         torrent_path: str,
@@ -60,7 +63,7 @@ class BitTorrentClient:
             return
 
         # Initialize statistics
-        self.stats = Statistics(self.torrent.total_size)
+        self.stats = Statistics(self.torrent)
 
         # Initialize piece manager
         self.piece_manager = PieceManager(self.torrent, output_dir)
@@ -362,7 +365,6 @@ class BitTorrentClient:
         time.sleep(1)
 
     def pause(self):
-        # XXX not implemented yet
         """Pause the client"""
         if self.state in [
             BitTorrentClientState.DOWNLOADING,
@@ -377,6 +379,7 @@ class BitTorrentClient:
                 connection.pause()
 
             # Pause discovery mechanisms
+            # we might not want to do this
             for discovery in self.discovery_mechanisms:
                 if hasattr(discovery, "pause") and callable(
                     getattr(discovery, "pause")
@@ -389,7 +392,6 @@ class BitTorrentClient:
                         )
 
     def resume(self):
-        # XXX not implemented yet
         """Resume the client"""
         if self.state == BitTorrentClientState.PAUSED:
             self.logger.info("Resuming client")
@@ -462,3 +464,59 @@ class BitTorrentClient:
     def get_state(self) -> BitTorrentClientState:
         """Get current client state"""
         return self.state
+
+    def __str__(self):
+        return f"<BlobTorrentClient (version={self.version}, connections={len(self.connection_manager)})>"
+
+
+@logged
+class TorrentManager:
+    def __init__(self, output_dir="./out", torrent_dir="./torrent"):
+        fallback = Path("/out/")
+        out = Path(output_dir)
+        if not out.exists():
+            out = fallback
+        self.out_dir = out
+
+        fallback = Path("/torrent/")
+        torrent = Path(torrent_dir)
+        if not torrent.exists():
+            torrent = fallback
+        self.torrent_dir = torrent
+
+        torrents = list(self.torrent_dir.glob("*.torrent"))
+        self.logger.info(
+            "Initializing TorrentManager (%s, %s, %d torrents)",
+            self.out_dir,
+            self.torrent_dir,
+            len(torrents),
+        )
+
+        self.clients = {}
+        for torrent in torrents:
+            # port is allocated automatically
+            client = BitTorrentClient(torrent, self.out_dir)
+            self.logger.info("Found torrent %s", client)
+            self.clients[client.torrent.info_hash] = client
+
+    def add_torrent(self, torrent_data: str, download_dir: str) -> str:
+        """Add torrent from base64 or magnet URI"""
+        pass
+
+    def get_torrents(self):
+        """Get all torrents across all clients"""
+        return {
+            info_hash: client.get_stats() for info_hash, client in self.clients.items()
+        }
+
+    def get_trackers(self, info_hash):
+        return []
+
+    def perform_action(self, torrent_hash: str, action: str):
+        """Perform action on torrent"""
+        pass
+
+
+if __name__ == "__main__":
+    manager = TorrentManager()
+    print(manager.get_torrents())

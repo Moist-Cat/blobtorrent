@@ -543,9 +543,6 @@ class DHTDiscovery(PeerDiscovery):
         self.initialized = False
         self.transactions = {}  # Track ongoing transactions
 
-        # self.bootstrap_nodes = [
-        #    ("blobtorrent-node", 7882),
-        # ]
         self.bootstrap_nodes = [
             ("router.bittorrent.com", 6881),
             ("dht.transmissionbt.com", 6881),
@@ -1732,5 +1729,6 @@ class SmartSubnetScannerDriver(SubnetScannerDriver):
 # DRIVERS = [DHTDiscovery,]
 # DRIVERS = [LocalPeerDiscoveryDriver,]
 DRIVERS = [
+    TrackerDriver,
     SmartSubnetScannerDriver,
 ]

@@ -170,6 +170,8 @@ class TorrentFile:
                 # trackerless
                 self.announce = None
 
+            self.name = self.info.get(b"name", b"Unknown").decode()
+
             self.logger.info(f"Total size: {self.total_size} bytes")
             self.logger.info(f"Piece length: {self.piece_length} bytes")
             self.logger.info(f"Number of pieces: {self.num_pieces}")
