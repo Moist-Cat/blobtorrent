@@ -255,6 +255,26 @@ class ConnectionManager:
                     return True
             return False
 
+    def get_total_uploaded(self) -> int:
+        """Get total uploaded bytes across all connections"""
+        total = 0
+        for connection in self.active_connections:
+            if hasattr(connection, 'uploaded_bytes'):
+                total += connection.uploaded_bytes
+        return total
+
+    def get_seeder_count(self) -> int:
+        """Count number of seeders among connected peers"""
+        seeders = 0
+        for connection in self.active_connections:
+            if hasattr(connection, 'is_seeder') and connection.is_seeder:
+                seeders += 1
+        return seeders
+
+    def get_connection_count(self) -> int:
+        """Get number of active connections"""
+        return len([c for c in self.active_connections if c.is_alive()])
+
     def __len__(self):
         return len(self.active_connections)
 

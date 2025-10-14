@@ -138,6 +138,7 @@ class PeerWireProtocol:
         """
         self.socket = socket
         self.peer = peer
+        self.connected = True
 
         try:
             # Perform handshake for incoming connection
@@ -145,7 +146,6 @@ class PeerWireProtocol:
         except Exception as e:
             self.logger.error(f"Error handling incoming connection from {peer}: {e}")
             return False
-        self.connected = True
         return True
 
     def _handshake(self, is_incoming: bool = False) -> bool:

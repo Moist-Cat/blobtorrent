@@ -42,6 +42,9 @@ services:
         condition: on-failure
         delay: 5s
         max_attempts: 3
+      placement:
+        constraints:
+          - node.role == manager
       resources:
         limits:
           memory: 256M
@@ -52,7 +55,7 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    command: ["tail", "-f", "/dev/null"]
+    command: ["python3", "api.py"]
 
   # Control node for managing the swarm
   control-node:
@@ -66,23 +69,6 @@ services:
       placement:
         constraints: [node.role == manager]
     command: ["tail", "-f", "/dev/null"]
-
-  # DNS server for custom domain resolution
-  dns-server:
-    image: sameersbn/bind:latest
-    environment:
-      - ROOT_PASSWORD=password
-    volumes:
-      - ./dns:/data
-    networks:
-      - blobtorrent-net
-    deploy:
-      placement:
-        constraints: [node.role == manager]
-    ports:
-      #- "53:53/udp"
-      #- "53:53/tcp"
-      - "10000:10000"  # Webmin
 
   # Monitoring and visualization
   monitor:

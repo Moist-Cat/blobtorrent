@@ -1,3 +1,4 @@
+import threading
 import time
 import os
 import binascii
@@ -119,28 +120,50 @@ class BitTorrentClient:
         return peer_id
 
     def _update_stats(self):
-        """Update client statistics"""
-        # Update downloaded bytes
+        """Update client statistics with real data"""
+        current_time = time.time()
+
+        # Get actual downloaded bytes from piece manager
         downloaded = self.piece_manager.get_total_downloaded()
         self.stats.update_downloaded(downloaded)
 
-        # Update uploaded bytes (if tracking is implemented)
-        # uploaded = self.connection_manager.get_total_uploaded()
-        # self.stats.update_uploaded(uploaded)
+        uploaded = self.connection_manager.get_total_uploaded()
+        self.stats.update_uploaded(uploaded)
 
         # Update peer counts
-        connected = self.connection_manager.get_connection_count()
-        total = len(self._get_all_peers())
-        self.stats.update_peer_counts(connected, total)
+        connected_peers = self.connection_manager.get_connection_count()
+        total_peers = len(self._get_all_peers())
+        seeders = self.connection_manager.get_seeder_count()
+        self.stats.update_peer_counts(connected_peers, total_peers, seeders)
+
+        # Update state based on client state
+        state_mapping = {
+            BitTorrentClientState.INITIALIZING: 0,
+            BitTorrentClientState.DISCOVERING_PEERS: 0,
+            BitTorrentClientState.DOWNLOADING: 1,
+            BitTorrentClientState.SEEDING: 2,
+            BitTorrentClientState.PAUSED: 0,
+            BitTorrentClientState.STOPPED: 0,
+            BitTorrentClientState.ERROR: 4
+        }
+        state_code = state_mapping[self.state]
+        self.stats.update_state(state_code)
+
+        # Update activity
+        self.stats.update_activity()
 
         # Log stats periodically
-        if int(time.time()) % 10 == 0:  # Log every 10 seconds
+        if int(current_time) % 10 == 0:
             stats = self.stats.get_stats_dict()
             self.logger.info(
-                f"Stats: Downloaded: {stats['downloaded']} bytes, "
-                f"Speed: {stats['download_speed']/1024:.2f} KB/s, "
-                f"Peers: {stats['connected_peers']}/{stats['total_peers']}, "
-                f"State: {self.state}"
+                f"Stats: Progress: {stats['progress']:.1%}, "
+                f"Down: {stats['down_rate']/1024:.1f} KB/s, "
+                f"Up: {stats['up_rate']/1024:.1f} KB/s, "
+                f"Peers: {stats['peers_connected']}/{stats['peers_accounted']}, "
+                f"Active: {stats['is_active']}, "
+                f"Complete: {stats['is_complete']}, "
+                f"State: {stats['state']}, "
+                f"Code: {stats['state_code']}"
             )
 
     def _get_all_peers(self) -> Set[Tuple[str, int]]:
@@ -322,7 +345,7 @@ class BitTorrentClient:
             return
 
         # Refresh peers periodically
-        if int(time.time()) % 30 == 0:  # Every 5 minutes
+        if int(time.time()) % 300 == 0:  # Every 5 minutes
             peers = list(self._get_all_peers())
             for peer in peers:
                 if self.connection_manager.already_connected_to(peer):
@@ -493,18 +516,33 @@ class TorrentManager:
         )
 
         self.clients = {}
+        self.client_threads = {}
         for torrent in torrents:
             # port is allocated automatically
             client = BitTorrentClient(torrent, self.out_dir)
-            self.logger.info("Found torrent %s", client)
+            thread = threading.Thread(target=client.start, daemon=True)
+            self.client_threads[client.torrent.info_hash] = thread
             self.clients[client.torrent.info_hash] = client
+
+            self.logger.info("Found torrent %s", client)
+            thread.start()
 
     def add_torrent(self, torrent_data: str, download_dir: str) -> str:
         """Add torrent from base64 or magnet URI"""
         pass
 
     def get_torrents(self):
-        """Get all torrents across all clients"""
+        """Get enhanced torrent statistics"""
+        # XXX might be a duplicate
+        torrents = {}
+        for info_hash, client in self.clients.items():
+            stats = client.get_stats()
+            stats_dict = stats.get_stats_dict() if hasattr(stats, 'get_stats_dict') else stats
+            
+            # Ensure we have all required fields
+            torrents[info_hash] = stats_dict
+        
+        return torrents
         return {
             info_hash: client.get_stats() for info_hash, client in self.clients.items()
         }

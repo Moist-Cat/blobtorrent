@@ -66,23 +66,30 @@ class MethodMapper:
             'system.listMethods', 'system.methodSignature', 'system.methodHelp', #'system.multicall',
             
             # Torrent listing and info
-            'd.multicall2', 'd.name', 'd.hash', 'd.size_bytes', 
+            'd.multicall2', 'd.name', 'd.hash', 'd.size_bytes',
             'd.directory',
-            #'d.completed_bytes', 'd.down.rate', 'd.up.rate',
-            #'d.peers_connected', 'd.state', 'd.ratio', 'd.bytes_done', 'd.message',
-            #'d.base_path', 'd.base_filename', 'd.down.total', 'd.up.total',
-            #'d.left_bytes', 'd.is_active', 'd.complete', 'd.is_private', 'd.peers_accounted',
-            #'d.peers_not_connected', 'd.creation_date',
-            #'d.custom1', 'd.custom2', 'd.priority', 'd.size_chunks', 'd.completed_chunks',
-            #'d.chunk_size', 'd.hashing', 'd.ignore_commands',
-            #'d.local_id', 'd.connection_current', 'd.connection_leech',
-            #'d.connection_seed', 'd.tied_to_file', 'd.bitfield',
-            #'d.tracker_focus', 'd.tracker_numwant', 'd.activity_time_last',
-            #'d.activity_time_seen', 'd.throttle_name', 'd.is_hash_checking',
-            #'d.is_hash_checked', 'd.is_open', 'd.is_multi_file',
+            'd.completed_bytes', 'd.down.rate', 'd.up.rate',
+            'd.peers_connected', 'd.state', 'd.ratio', 'd.bytes_done', 'd.message',
+            'd.base_path',
+            'd.base_filename',
+            'd.down.total', 'd.up.total',
+            'd.left_bytes', 'd.is_active', 'd.complete', 'd.is_private',
+
+            'd.peers_accounted', 'd.peers_not_connected',
+            'd.creation_date',
+            'd.custom1', 'd.custom2', 'd.priority',
+            'd.size_chunks', 'd.completed_chunks',
+            'd.chunk_size',
+            'd.hashing', 'd.ignore_commands',
+            'd.local_id', 'd.connection_current', 'd.connection_leech',
+            'd.connection_seed', 'd.tied_to_file', 'd.bitfield',
+            'd.tracker_focus', 'd.tracker_numwant',
+            'd.activity_time_last',
+            'd.activity_time_seen', 'd.throttle_name', 'd.is_hash_checking',
+            'd.is_hash_checked', 'd.is_open', 'd.is_multi_file',
             
             # Torrent control methods
-            #'d.erase', 'd.pause', 'd.resume', 'd.stop', 'd.close', 'd.check_hash',
+            'd.erase', 'd.pause', 'd.resume', 'd.stop', 'd.close', 'd.check_hash',
             
             # File methods
             #'f.multicall', 'f.path', 'f.size_bytes', 'f.completed_chunks',
@@ -149,7 +156,7 @@ class MethodMapper:
         logger.info(f"Retrieved {len(torrents_data)} torrents from backend")
         
         result = []
-        for torrent in torrents_data[:1]:
+        for torrent in torrents_data:
             torrent_result = []
             info_hash = torrent.get('info_hash', '')
             
@@ -203,62 +210,68 @@ class MethodMapper:
         return state in ['downloading', 'seeding', 'checking']
 
     def _map_method_to_field(self, method: str, torrent: Dict) -> Any:
-        """Map rTorrent method names to backend field names"""
-        # Comprehensive mapping based on actual backend API response
+        """Enhanced mapping with all required Flood fields"""
         mapping = {
             # Basic info
             'd.hash': torrent.get('info_hash', ''),
             'd.name': torrent.get('name', 'Unknown'),
-            'd.base_path': torrent.get('download_path', ''),
-            'd.base_filename': torrent.get('name', 'Unknown'),
-            'd.directory': torrent.get('download_path', ''),
+            'd.base_path': torrent.get('base_path', ''),
+            'd.base_filename': torrent.get('base_filename', 'Unknown'),
+            'd.directory': torrent.get('directory', ''),
             
             # Size and progress
             'd.size_bytes': torrent.get('size_bytes', 0),
             'd.completed_bytes': torrent.get('completed_bytes', 0),
-            'd.left_bytes': torrent.get('size_bytes', 0) - torrent.get('completed_bytes', 0),
-            'd.size_chunks': torrent.get('total_chunks', 0),
+            'd.left_bytes': torrent.get('left_bytes', 0),
+            'd.size_chunks': torrent.get('size_chunks', 0),
             'd.completed_chunks': torrent.get('completed_chunks', 0),
-            'd.hashing': 0,
             'd.chunk_size': torrent.get('chunk_size', 16384),
             
             # Transfer stats
-            'd.down.rate': torrent.get('down_rate', 0),
-            'd.up.rate': torrent.get('up_rate', 0),
+            'd.down.rate': str(torrent.get('down_rate', 0)),
+            'd.up.rate': str(torrent.get('up_rate', 0)),
             'd.down.total': torrent.get('down_total', 0),
             'd.up.total': torrent.get('up_total', 0),
-            'd.ratio': torrent.get('ratio', 0.0),
-            'd.bytes_done': 0,
+            'd.ratio': str(torrent.get('ratio', 0.0)),
+            'd.bytes_done': torrent.get('completed_bytes', 0),
             
             # Peer info
             'd.peers_connected': torrent.get('peers_connected', 0),
             'd.peers_accounted': torrent.get('peers_accounted', 0),
             'd.peers_not_connected': torrent.get('peers_not_connected', 0),
+            'd.peers_complete': torrent.get('peers_complete', 0),
             
             # State and status
-            'd.state': self._map_state_to_rtorrent(torrent.get('state', 'stopped')),
+            'd.state': torrent.get('state_code', 0),
             'd.message': torrent.get('message', ''),
-            'd.is_active': 1 if self._get_torrent_active_state(torrent) else 0,
-            'd.complete': 1 if torrent.get('completed_bytes', 0) >= torrent.get('size_bytes', 1) else 0,
+            'd.is_active': 1 if torrent.get('is_active') else 0,
+            'd.complete': 1 if torrent.get('is_complete') else 0,
             'd.is_private': 0,
-            'd.is_hash_checking': 1 if torrent.get('state') == 'checking' else 0,
-            'd.is_hash_checked': 1 if torrent.get('state') != 'checking' else 0,
+            'd.is_hash_checking': 0,  # You can implement this
+            'd.is_hash_checked': 1,
             'd.is_open': 1,
-            'd.is_multi_file': torrent.get('is_multi_file', 1),
+            'd.is_multi_file': 1,
             
             # Additional fields
-            'd.creation_date': torrent.get('creation_date', 0),
-            'd.priority': torrent.get('priority', 1),
+            'd.creation_date': str(torrent.get('added_time', 0)),
+            'd.priority': 1,
             'd.local_id': torrent.get('info_hash', '')[:8],
-            'd.connection_current': f"↓{torrent.get('down_rate', 0)}/↑{torrent.get('up_rate', 0)}",
-            'd.connection_leech': 'leech',
-            'd.connection_seed': 'seed',
-            'd.tied_to_file': torrent.get('file_path', ''),
-            'd.custom1': torrent.get('label', ''),
-            'd.custom2': "",
+            'd.connection_current': f"↓{torrent.get('down_rate', 0):.0f}/↑{torrent.get('up_rate', 0):.0f}",
+            'd.connection_leech': 'leech' if not torrent.get('is_complete') else 'seed',
+            'd.connection_seed': 'seed' if torrent.get('is_complete') else 'leech',
+            'd.tied_to_file': torrent.get('download_path', ''),
+            'd.custom1': '',
+            'd.custom2': '',
+            'd.ignore_commands': 0,
+            'd.hashing': 0,
+            'd.bitfield': '',
+            'd.tracker_focus': 0,
+            'd.tracker_numwant': 50,
+            'd.activity_time_last': str(torrent.get('last_activity', 0)),
+            'd.activity_time_seen': str(torrent.get('added_time', 0)),
+            'd.throttle_name': '',
         }
-        
-        value = mapping.get(method, False)
+        value = mapping.get(method, '')
         logger.debug(f"Mapped {method} to value: {value}")
         return value
 

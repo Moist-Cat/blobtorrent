@@ -125,7 +125,7 @@ class TorrentAPIServer:
     async def list_torrents(self, request):
         """List all active torrents"""
         torrents = []
-        for info_hash, data in self.active_torrents.items():
+        for info_hash, data in self.client_manager.get_torrents().items():
             torrent_info = await self._get_torrent_info(info_hash, data)
             torrents.append(torrent_info)
 
@@ -444,7 +444,6 @@ class TorrentAPIServer:
 
             try:
                 # Parse torrent file to get info hash
-                # This would use your existing TorrentFile class
                 info_hash = await self._get_torrent_info_hash(Path(temp_path))
 
                 if not info_hash:
@@ -475,26 +474,43 @@ class TorrentAPIServer:
         except Exception as e:
             raise ValueError(f"Invalid torrent file: {e}")
 
-    async def _get_torrent_info(
-        self, info_hash: str, torrent_data: Dict
-    ) -> Dict[str, Any]:
-        """Get detailed torrent information (rTorrent compatible)"""
+    async def _get_torrent_info(self, info_hash: str, torrent_data: Dict) -> Dict[str, Any]:
+        """Get enhanced torrent information for web UI"""
+        # Convert bytes info_hash to string if needed
+        if isinstance(info_hash, bytes):
+            info_hash_str = info_hash.hex()
+        else:
+            info_hash_str = info_hash
+
         return {
-            "info_hash": binascii.hexlify(info_hash).decode(),
+            "info_hash": info_hash_str,
             "name": torrent_data.get("name", "Unknown"),
-            "size_bytes": torrent_data["size_bytes"],
-            "completed_bytes": 0,
-            "up_total": 0,
-            "down_total": 0,
-            "up_rate": 0,
-            "down_rate": 0,
-            "ratio": 0.0,
-            "peers_connected": torrent_data["connected_peers"],
-            "peers_accounted": torrent_data["connected_peers"],
-            "state": torrent_data.get("status", "stopped"),
+            "size_bytes": torrent_data.get("size_bytes", 0),
+            "completed_bytes": torrent_data.get("completed_bytes", 0),
+            "up_total": torrent_data.get("up_total", 0),
+            "down_total": torrent_data.get("down_total", 0),
+            "up_rate": torrent_data.get("up_rate", 0),
+            "down_rate": torrent_data.get("down_rate", 0),
+            "ratio": torrent_data.get("ratio", 0.0),
+            "peers_connected": torrent_data.get("peers_connected", 0),
+            "peers_accounted": torrent_data.get("peers_accounted", 0),
+            "peers_not_connected": torrent_data.get("peers_not_connected", 0),
+            "state": torrent_data.get("state", "stopped"),
+            "state_code": torrent_data.get("state_code", 0),
             "message": torrent_data.get("message", ""),
-            "added_time": torrent_data.get("added_time", 0),
+            "added_time": torrent_data.get("added_time", time.time()),
             "download_path": torrent_data.get("download_path", ""),
+            "is_active": torrent_data.get("is_active", False),
+            "is_complete": torrent_data.get("is_complete", False),
+            "size_chunks": torrent_data.get("size_chunks", 0),
+            "completed_chunks": torrent_data.get("completed_chunks", 0),
+            "chunk_size": torrent_data.get("chunk_size", 16384),
+            "left_bytes": torrent_data.get("left_bytes", 0),
+            "base_path": torrent_data.get("base_path", ""),
+            "base_filename": torrent_data.get("base_filename", ""),
+            "directory": torrent_data.get("directory", ""),
+            "progress": torrent_data.get("completed_bytes", 0) / max(1, torrent_data.get("size_bytes", 1)),
+            "last_activity": torrent_data.get("last_activity", 0),
         }
 
     async def get_torrent_files(self, info_hash: str) -> List[Dict]:

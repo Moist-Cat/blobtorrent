@@ -343,7 +343,7 @@ class LocalPeerDiscoveryDriver(PeerDiscovery):
     # LPD multicast address and port as per BEP 14
     LPD_MULTICAST_ADDR = "239.192.152.143"
     LPD_MULTICAST_PORT = 6771
-    LPD_ANNOUNCE_INTERVAL = 300  # 5 minutes as per specification
+    LPD_ANNOUNCE_INTERVAL = 30  # 5 minutes as per specification
 
     def __init__(self, torrent, peer_id, port=6881):
         self.torrent = torrent
@@ -1083,8 +1083,8 @@ class SubnetScannerDriver(PeerDiscovery):
     # Configuration
     MAX_WORKERS = 6553  # powerful...
     SCAN_INTERVAL = 300  # 5 minutes between full scans
-    ICMP_TIMEOUT = 1  # ICMP response timeout
-    CONNECTION_TIMEOUT = 0.1  # TCP connection timeout
+    ICMP_TIMEOUT = 0.01  # ICMP response timeout
+    CONNECTION_TIMEOUT = 1  # TCP connection timeout
 
     def __init__(
         self,
@@ -1275,6 +1275,9 @@ class SubnetScannerDriver(PeerDiscovery):
         hosts_to_ping = []
         for subnet_cidr in self.subnet_cidrs:
             network = ipaddress.ip_network(subnet_cidr, strict=False)
+            if len(list(network.hosts())) > 1000:
+                self.logger.warning("Rejecting network %s (too big!)", network)
+                continue
 
             # Generate all host IPs in subnet
             hosts_to_ping.extend((str(host) for host in network.hosts()))
@@ -1298,13 +1301,22 @@ class SubnetScannerDriver(PeerDiscovery):
             # Send all ICMP echo requests first
             for seq, host in enumerate(hosts_to_ping):
                 # we don't care about the result
-                threading.Thread(
-                    target=self._send_icmp_echo,
-                    # seq can be >= 65535
-                    # so it might not fit
-                    args=(sock, host, icmp_id, seq % 65535),
-                    daemon=True,
-                ).start()
+                flag = False
+                while not flag:
+                    try:
+                        threading.Thread(
+                            target=self._send_icmp_echo,
+                            # seq can be >= 65535
+                            # so it might not fit
+                            args=(sock, host, icmp_id, seq % 65535),
+                            daemon=True,
+                        ).start()
+                    except RuntimeError:
+                        # too many threads!
+                        time.sleep(0.1)
+                    else:
+                        flag = True
+
 
             # Listen for responses
             start_time = time.time()
@@ -1727,8 +1739,8 @@ class SmartSubnetScannerDriver(SubnetScannerDriver):
 
 # DRIVERS = [TrackerDriver, LocalPeerDiscoveryDriver, SmartSubnetScannerDriver]
 # DRIVERS = [DHTDiscovery,]
-# DRIVERS = [LocalPeerDiscoveryDriver,]
+#DRIVERS = [LocalPeerDiscoveryDriver,]
 DRIVERS = [
-    TrackerDriver,
+    #TrackerDriver,
     SmartSubnetScannerDriver,
 ]

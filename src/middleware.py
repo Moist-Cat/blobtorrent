@@ -39,7 +39,7 @@ class PieceManager:
     def get_total_downloaded(self):
         # read-only
         # no need for a lock here
-        return Counter(self.downloaded_pieces)[True]
+        return min(Counter(self.downloaded_pieces)[True] * self.torrent.piece_length, self.torrent.total_size)
 
     def get_bitfield(self) -> bytes:
         """Generate a bitfield representing which pieces we have"""
