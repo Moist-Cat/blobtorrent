@@ -1,8 +1,11 @@
+import binascii
+import queue
+from pathlib import Path
 import socket
 import struct
 import hashlib
 import threading
-from typing import Tuple, Any, Optional
+from typing import Tuple, Any, Optional, Set
 import time
 import math
 
@@ -104,7 +107,8 @@ class PeerConnection(threading.Thread):
 
     def is_alive(self):
         """Check if the connection is still active"""
-        return self.running and self.protocol.connected
+        #return self.running and self.protocol.connected
+        return self.running
 
     def close(self):
         """Close the connection"""
@@ -255,22 +259,6 @@ class ConnectionManager:
                     return True
             return False
 
-    def get_total_uploaded(self) -> int:
-        """Get total uploaded bytes across all connections"""
-        total = 0
-        for connection in self.active_connections:
-            if hasattr(connection, 'uploaded_bytes'):
-                total += connection.uploaded_bytes
-        return total
-
-    def get_seeder_count(self) -> int:
-        """Count number of seeders among connected peers"""
-        seeders = 0
-        for connection in self.active_connections:
-            if hasattr(connection, 'is_seeder') and connection.is_seeder:
-                seeders += 1
-        return seeders
-
     def get_connection_count(self) -> int:
         """Get number of active connections"""
         return len([c for c in self.active_connections if c.is_alive()])
@@ -296,6 +284,36 @@ class DownloadHandler:
         self.bitfield = None
         self.current_piece = None
         self.paused = False
+        self.wait_timeout = 90
+        self.sleep_time = 1
+
+        # cache each block
+        ih = binascii.hexlify(torrent.info_hash).decode()
+        self.cache_dir = Path(f"/tmp/blobcache/{ih}/")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def load_piece(self, piece_index):
+        piece_file = self.cache_dir / str(piece_index)
+        if not piece_file.exists():
+            self.save_piece(piece_index)
+        with open(piece_file, "rb") as file:
+            data = file.read()
+        return data
+
+    def save_piece(self, piece_index, data=b""):
+        piece_file = self.cache_dir / str(piece_index)
+        with open(piece_file, "wb") as file:
+            file.write(data)
+        return data
+
+    def invalidate_piece_cache(self, piece_index):
+        piece_file = self.cache_dir / str(piece_index)
+        if piece_file.exists():
+            piece_file.unlink()
+        else:
+            self.logging.warning(
+                "Tried to invalidate unexisting cache file for %d", piece_index
+            )
 
     def run(self):
         """Execute the downloading protocol"""
@@ -308,14 +326,14 @@ class DownloadHandler:
                 self.logger.warning(f"No bitfield received from {self.protocol.peer}")
                 return
 
-            self.piece_manager.update_availability(self.bitfield)
+            self.piece_manager.update_availability(self.bitfield, self.protocol.peer)
             self.protocol.send_interested()
 
             # Wait for unchoke
             self._wait_for_unchoke()
 
             # Download pieces until complete
-            while not self.piece_manager.is_complete():
+            while not self.piece_manager.is_complete() and self.protocol.connected:
                 if self.paused:
                     self.logger.debug("Paused...")
                     time.sleep(5)
@@ -325,7 +343,7 @@ class DownloadHandler:
                     continue
 
                 # Get a piece to download
-                piece_index = self.piece_manager.get_rarest_piece()
+                piece_index = self.piece_manager.get_rarest_piece(self.protocol.peer)
                 if piece_index == -1:
                     self.logger.info(
                         f"No more pieces to download from {self.protocol.peer}"
@@ -365,10 +383,10 @@ class DownloadHandler:
     def _wait_for_unchoke(self):
         """Wait for unchoke message with timeout"""
         start_time = time.time()
-        while time.time() - start_time < 30:  # 30 second timeout
+        while time.time() - start_time < self.wait_timeout:
             msg_id, payload = self.protocol.receive_message()
             if msg_id is None:
-                time.sleep(0.1)
+                time.sleep(self.sleep_time)
                 continue
 
             if msg_id == PeerWireProtocol.UNCHOKE:
@@ -391,10 +409,10 @@ class DownloadHandler:
     def _receive_bitfield(self):
         self.logger.info(f"Waiting for bitfield from {self.protocol.peer}")
         start_time = time.time()
-        while time.time() - start_time < 30:  # 30 second timeout
+        while time.time() - start_time < self.wait_timeout:
             msg_id, payload = self.protocol.receive_message()
             if msg_id is None:
-                time.sleep(0.1)
+                time.sleep(self.sleep_time)
                 continue
 
             if msg_id == PeerWireProtocol.BITFIELD:
@@ -424,11 +442,18 @@ class DownloadHandler:
 
         block_size = 2**14
         num_blocks = math.ceil(piece_length / block_size)
-        data = b""
+        # data = b""
+        data = self.load_piece(piece_index)
+        starting_index = math.ceil(len(data) / block_size)
 
-        self.logger.debug(f"Downloading piece {piece_index} with {num_blocks} blocks")
+        self.logger.debug(
+            f"Downloading piece %d with %d blocks (already downloaded %d blocks)",
+            piece_index,
+            num_blocks,
+            starting_index,
+        )
 
-        for block_index in range(num_blocks):
+        for block_index in range(starting_index, num_blocks):
             begin = block_index * block_size
             block_length = min(block_size, piece_length - begin)
 
@@ -436,11 +461,11 @@ class DownloadHandler:
             block_start_time = time.time()
             block_received = False
 
-            while time.time() - block_start_time < 30:  # 30 second timeout per block
+            while time.time() - block_start_time < self.wait_timeout:
                 msg_id, payload = self.protocol.receive_message()
 
                 if msg_id is None:
-                    time.sleep(0.1)
+                    time.sleep(self.sleep_time)
                     continue
 
                 if msg_id == PeerWireProtocol.PIECE:
@@ -452,16 +477,17 @@ class DownloadHandler:
                         self.logger.warning(
                             f"Received wrong block: expected {piece_index}:{begin}, got {index}:{begin_offset}"
                         )
-                        continue  # Not the block we're waiting for
+                        return False  # Not the block we're waiting for
 
                     # Critical: Check block length
                     if len(block_data) != block_length:
                         self.logger.warning(
                             f"Incorrect block length: expected {block_length}, got {len(block_data)}"
                         )
-                        continue
+                        return False
 
                     data += block_data
+                    self.save_piece(piece_index, data)
                     self.logger.debug(
                         f"Received block {block_index+1}/{num_blocks} for piece {piece_index}"
                     )
@@ -487,6 +513,7 @@ class DownloadHandler:
         # Verify piece hash before saving
         computed_hash = hashlib.sha1(data).digest()
         expected_hash = self.torrent.piece_hashes[piece_index]
+        # self.invalidate_piece_cache(piece_index)
         if computed_hash != expected_hash:
             self.logger.error(
                 f"Hash mismatch for piece {piece_index}. Expected {expected_hash.hex()}, got {computed_hash.hex()}"

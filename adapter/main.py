@@ -11,8 +11,8 @@ from xmlrpc.server import SimpleXMLRPCDispatcher
 
 BACKEND_URL = Config().BACKEND_URL
 
-class Handler(SCGIHandler):
 
+class Handler(SCGIHandler):
     def __init__(self, *args, **kwargs):
         self.dispatcher = SimpleXMLRPCDispatcher(allow_none=True, encoding=None)
         self.dispatcher.register_introspection_functions()
@@ -33,20 +33,27 @@ class Handler(SCGIHandler):
         output.write(b"\r\n")
         output.write(response)
 
+
 def run():
     config = Config()
 
-    server = scgi_server.SCGIServer(host=config.SCGI_HOST, port=config.SCGI_PORT, handler_class=Handler, max_children=1)
+    server = scgi_server.SCGIServer(
+        host=config.SCGI_HOST,
+        port=config.SCGI_PORT,
+        handler_class=Handler,
+        max_children=1,
+    )
 
     print(f"Starting SCGI server for BitTorrent backend...")
     print(f"Backend URL: {config.BACKEND_URL}")
-    
+
     print(f"Listening on TCP: {config.SCGI_HOST}:{config.SCGI_PORT}")
-    
+
     try:
         server.serve()
     except KeyboardInterrupt:
         print("\nShutting down server...")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     run()

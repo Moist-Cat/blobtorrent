@@ -90,27 +90,9 @@ class TorrentAPIServer:
         await site.start()
 
         logger.info(f"REST API server started on {self.host}:{self.port}")
-        await self._load_existing_torrents()
 
         # Keep the server running
         await asyncio.Future()
-
-    async def _load_existing_torrents(self):
-        """Load existing torrents from data directory"""
-        torrent_files = list(self.data_directory.glob("**/*.torrent"))
-        for torrent_file in torrent_files:
-            try:
-                # Extract info_hash from filename or parse torrent
-                info_hash = await self._get_torrent_info_hash(torrent_file)
-                if info_hash:
-                    self.active_torrents[info_hash] = {
-                        "file_path": str(torrent_file),
-                        "name": torrent_file.stem,
-                        "added_time": time.time(),
-                        "status": "stopped",
-                    }
-            except Exception as e:
-                logger.error(f"Error loading torrent {torrent_file}: {e}")
 
     async def _get_torrent_info_hash(self, torrent_path: Path) -> Optional[str]:
         """Extract info hash from torrent file"""
@@ -160,54 +142,53 @@ class TorrentAPIServer:
         """Get detailed information about a specific torrent"""
         info_hash = request.match_info["info_hash"]
 
-        if info_hash not in self.active_torrents:
+        active_torrents = self.client_manager.get_torrents()
+
+        if info_hash not in active_torrents:
             return web.Response(status=404, text="Torrent not found")
 
         torrent_info = await self._get_torrent_info(
-            info_hash, self.active_torrents[info_hash]
+            info_hash, active_torrents[info_hash]
         )
         return web.json_response(torrent_info)
 
     async def start_torrent(self, request):
         """Start a torrent"""
         info_hash = request.match_info["info_hash"]
+        active_torrents = self.client_manager.get_torrents()
 
-        if info_hash not in self.active_torrents:
+        if info_hash not in active_torrents:
             return web.Response(status=404, text="Torrent not found")
 
         # Start the torrent using client manager
         if self.client_manager:
             await self.client_manager.start_torrent(info_hash)
 
-        self.active_torrents[info_hash]["status"] = "downloading"
-
         return web.json_response({"status": "started"})
 
     async def pause_torrent(self, request):
         """Pause a torrent"""
         info_hash = request.match_info["info_hash"]
+        active_torrents = self.client_manager.get_torrents()
 
-        if info_hash not in self.active_torrents:
+        if info_hash not in active_torrents:
             return web.Response(status=404, text="Torrent not found")
 
         if self.client_manager:
             await self.client_manager.pause_torrent(info_hash)
-
-        self.active_torrents[info_hash]["status"] = "paused"
 
         return web.json_response({"status": "paused"})
 
     async def stop_torrent(self, request):
         """Stop a torrent"""
         info_hash = request.match_info["info_hash"]
+        active_torrents = self.client_manager.get_torrents()
 
-        if info_hash not in self.active_torrents:
+        if info_hash not in active_torrents:
             return web.Response(status=404, text="Torrent not found")
 
         if self.client_manager:
             await self.client_manager.stop_torrent(info_hash)
-
-        self.active_torrents[info_hash]["status"] = "stopped"
 
         return web.json_response({"status": "stopped"})
 
@@ -216,34 +197,24 @@ class TorrentAPIServer:
         info_hash = request.match_info["info_hash"]
         data = await request.json()
         delete_files = data.get("delete_files", False)
+        active_torrents = self.client_manager.get_torrents()
 
-        if info_hash not in self.active_torrents:
+        if info_hash not in active_torrents:
             return web.Response(status=404, text="Torrent not found")
 
         if self.client_manager:
             await self.client_manager.remove_torrent(info_hash, delete_files)
-
-        if delete_files:
-            # Delete downloaded files
-            torrent_data = self.active_torrents[info_hash]
-            download_path = Path(torrent_data.get("download_path", ""))
-            if download_path.exists():
-                import shutil
-
-                shutil.rmtree(download_path)
-
-        del self.active_torrents[info_hash]
 
         return web.json_response({"status": "removed"})
 
     async def check_torrent(self, request):
         """Check torrent hash"""
         info_hash = request.match_info["info_hash"]
+        active_torrents = self.client_manager.get_torrents()
 
-        if info_hash not in self.active_torrents:
+        if info_hash not in active_torrents:
             return web.Response(status=404, text="Torrent not found")
 
-        # Implement hash checking logic
         if self.client_manager:
             await self.client_manager.check_torrent_hash(info_hash)
 
@@ -252,9 +223,9 @@ class TorrentAPIServer:
     # File Operations
     async def list_files(self, request):
         """List files in a torrent"""
-        info_hash = binascii.unhexlify(request.match_info["info_hash"])
+        info_hash = request.match_info["info_hash"]
 
-        if info_hash not in self.active_torrents:
+        if info_hash not in active_torrents:
             return web.Response(status=404, text="Torrent not found")
 
         files = await self._get_torrent_files(info_hash)
@@ -262,7 +233,7 @@ class TorrentAPIServer:
 
     async def set_file_priority(self, request):
         """Set file priority"""
-        info_hash = binascii.unhexlify(request.match_info["info_hash"])
+        info_hash = request.match_info["info_hash"]
         file_index = int(request.match_info["file_index"])
 
         data = await request.json()
@@ -279,7 +250,7 @@ class TorrentAPIServer:
     # Tracker Operations
     async def list_trackers(self, request):
         """List trackers for a torrent"""
-        info_hash = binascii.unhexlify(request.match_info["info_hash"])
+        info_hash = request.match_info["info_hash"]
 
         if info_hash not in self.active_torrents:
             return web.Response(status=404, text="Torrent not found")
@@ -474,7 +445,9 @@ class TorrentAPIServer:
         except Exception as e:
             raise ValueError(f"Invalid torrent file: {e}")
 
-    async def _get_torrent_info(self, info_hash: str, torrent_data: Dict) -> Dict[str, Any]:
+    async def _get_torrent_info(
+        self, info_hash: str, torrent_data: Dict
+    ) -> Dict[str, Any]:
         """Get enhanced torrent information for web UI"""
         # Convert bytes info_hash to string if needed
         if isinstance(info_hash, bytes):
@@ -482,36 +455,9 @@ class TorrentAPIServer:
         else:
             info_hash_str = info_hash
 
-        return {
-            "info_hash": info_hash_str,
-            "name": torrent_data.get("name", "Unknown"),
-            "size_bytes": torrent_data.get("size_bytes", 0),
-            "completed_bytes": torrent_data.get("completed_bytes", 0),
-            "up_total": torrent_data.get("up_total", 0),
-            "down_total": torrent_data.get("down_total", 0),
-            "up_rate": torrent_data.get("up_rate", 0),
-            "down_rate": torrent_data.get("down_rate", 0),
-            "ratio": torrent_data.get("ratio", 0.0),
-            "peers_connected": torrent_data.get("peers_connected", 0),
-            "peers_accounted": torrent_data.get("peers_accounted", 0),
-            "peers_not_connected": torrent_data.get("peers_not_connected", 0),
-            "state": torrent_data.get("state", "stopped"),
-            "state_code": torrent_data.get("state_code", 0),
-            "message": torrent_data.get("message", ""),
-            "added_time": torrent_data.get("added_time", time.time()),
-            "download_path": torrent_data.get("download_path", ""),
-            "is_active": torrent_data.get("is_active", False),
-            "is_complete": torrent_data.get("is_complete", False),
-            "size_chunks": torrent_data.get("size_chunks", 0),
-            "completed_chunks": torrent_data.get("completed_chunks", 0),
-            "chunk_size": torrent_data.get("chunk_size", 16384),
-            "left_bytes": torrent_data.get("left_bytes", 0),
-            "base_path": torrent_data.get("base_path", ""),
-            "base_filename": torrent_data.get("base_filename", ""),
-            "directory": torrent_data.get("directory", ""),
-            "progress": torrent_data.get("completed_bytes", 0) / max(1, torrent_data.get("size_bytes", 1)),
-            "last_activity": torrent_data.get("last_activity", 0),
-        }
+        torrent_data["info_hash"] = info_hash_str
+
+        return torrent_data
 
     async def get_torrent_files(self, info_hash: str) -> List[Dict]:
         """Get detailed file information for Flood"""
@@ -580,7 +526,7 @@ class TorrentAPIServer:
 
 async def main():
     """Main function to start the API server"""
-    api_server = TorrentAPIServer(client_manager=TorrentManager())
+    api_server = TorrentAPIServer(port=8000, data_directory="/out", client_manager=TorrentManager())
     await api_server.start()
 
 

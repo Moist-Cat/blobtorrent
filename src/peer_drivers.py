@@ -11,7 +11,7 @@ import time
 import urllib.parse
 import requests
 import random
-from typing import List, Tuple, Dict, Set, Optional
+from typing import List, Tuple, Dict, Set, Optional, Union
 import threading
 import hashlib
 import ipaddress
@@ -20,6 +20,7 @@ import threading
 import select
 import subprocess
 import re
+
 
 from filesystem import BencodeDecoder, BencodeEncoder
 from log import logged
@@ -59,6 +60,14 @@ class PeerDiscovery(ABC):
         pass
 
 
+# UDP tracker protocol constants
+UDP_CONNECT_MAGIC = 0x41727101980
+UDP_ACTION_CONNECT = 0
+UDP_ACTION_ANNOUNCE = 1
+UDP_ACTION_SCRAPE = 2
+UDP_ACTION_ERROR = 3
+
+
 @logged
 class TrackerDriver(PeerDiscovery):
     def __init__(
@@ -87,6 +96,14 @@ class TrackerDriver(PeerDiscovery):
         # Get all announce URLs from the torrent
         self.announce_urls = self._get_announce_urls()
         self.current_announce_url_index = 0
+
+        # UDP tracker connection state
+        self.udp_connection_id: Optional[int] = None
+        self.udp_connection_time = 0
+        self.udp_transaction_id = 0
+        # global timeout
+        # mainly for UDP
+        self.timeout = 30
 
         self.logger.info(
             f"TrackerDriver created for {torrent} with {len(self.announce_urls)} announce URLs"
@@ -132,18 +149,189 @@ class TrackerDriver(PeerDiscovery):
             self.uploaded = uploaded
             self.left = left
 
-    def announce(self, event: str = "") -> List[Tuple[str, int]]:
-        """Announce to the tracker with optional event"""
-        if not self.initialized:
-            self.logger.error("Tracker not initialized")
+    # announce
+    def _generate_transaction_id(self) -> int:
+        """Generate a new transaction ID for UDP tracker communication"""
+        self.udp_transaction_id = (self.udp_transaction_id + 1) % 0xFFFFFFFF
+        return self.udp_transaction_id
+
+    def _parse_udp_tracker_url(self, url: str) -> Tuple[str, int]:
+        """Parse UDP tracker URL into host and port"""
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname
+        port = parsed.port or 80  # Default port for UDP trackers is typically 80
+
+        if not host:
+            raise ValueError(f"Invalid UDP tracker URL: {url}")
+
+        return host, port
+
+    def _udp_connect(self, host: str, port: int) -> bool:
+        """Establish connection with UDP tracker"""
+        try:
+            # Create UDP socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(self.timeout)  # 10 second timeout
+
+            # Generate connection request
+            transaction_id = self._generate_transaction_id()
+            connect_request = struct.pack(
+                "!QII", UDP_CONNECT_MAGIC, UDP_ACTION_CONNECT, transaction_id
+            )
+
+            # Send connect request
+            sock.sendto(connect_request, (host, port))
+
+            # Receive response
+            response_data, _ = sock.recvfrom(16)  # Connect response is 16 bytes
+            sock.close()
+
+            if len(response_data) < 16:
+                self.logger.error("UDP connect response too short")
+                return False
+
+            # Parse response
+            action, transaction_id_resp, connection_id = struct.unpack(
+                "!IIQ", response_data
+            )
+
+            if action != UDP_ACTION_CONNECT:
+                self.logger.error(f"UDP connect failed: unexpected action {action}")
+                return False
+
+            if transaction_id_resp != transaction_id:
+                self.logger.error("UDP connect failed: transaction ID mismatch")
+                return False
+
+            # Store connection state
+            self.udp_connection_id = connection_id
+            self.udp_connection_time = time.time()
+            self.logger.info(f"UDP tracker connection established: {host}:{port}")
+            return True
+
+        except socket.timeout:
+            self.logger.error(f"UDP connect timeout: {host}:{port}")
+            return False
+        except Exception as e:
+            self.logger.error(f"UDP connect failed: {e}")
+            return False
+
+    def _udp_announce(
+        self, host: str, port: int, event: str = ""
+    ) -> List[Tuple[str, int]]:
+        """Announce to UDP tracker"""
+        if self.udp_connection_id is None:
+            # Try to establish connection first
+            if not self._udp_connect(host, port):
+                return []
+
+        try:
+            # Map event string to UDP event code
+            event_map = {
+                "": 0,  # None
+                "completed": 1,  # Completed
+                "started": 2,  # Started
+                "stopped": 3,  # Stopped
+            }
+            event_code = event_map.get(event, 0)
+
+            # Generate transaction ID
+            transaction_id = self._generate_transaction_id()
+
+            # Build announce request
+            key = 0x12345678  # Random key for tracking purposes
+            num_want = 50  # Request as many peers as possible
+
+            announce_request = struct.pack(
+                "!QII20s20sQQQIIIiH",
+                self.udp_connection_id,
+                UDP_ACTION_ANNOUNCE,
+                transaction_id,
+                self.torrent.info_hash,
+                self.peer_id,
+                self.downloaded,
+                self.left,
+                self.uploaded,
+                event_code,
+                0,  # IP address (0 = use sender's address)
+                key,
+                num_want,
+                self.port,
+            )
+
+            # Create socket and send request
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(self.timeout)
+            sock.sendto(announce_request, (host, port))
+
+            # Receive response (minimum 20 bytes header + peer data)
+            response_data, _ = sock.recvfrom(4096)
+            sock.close()
+
+            if len(response_data) < 20:
+                self.logger.error("UDP announce response too short")
+                return []
+
+            # Parse response header
+            action, transaction_id_resp, interval, leechers, seeders = struct.unpack(
+                "!IIIII", response_data[:20]
+            )
+
+            if action == UDP_ACTION_ERROR:
+                error_msg = response_data[8:].decode("utf-8", errors="ignore")
+                self.logger.error(f"UDP tracker error: {error_msg}")
+                return []
+
+            if action != UDP_ACTION_ANNOUNCE:
+                self.logger.error(f"UDP announce failed: unexpected action {action}")
+                return []
+
+            if transaction_id_resp != transaction_id:
+                self.logger.error("UDP announce failed: transaction ID mismatch")
+                return []
+
+            # Update tracker stats
+            self.interval = interval
+            self.complete = seeders
+            self.incomplete = leechers
+
+            self.logger.info(
+                f"UDP tracker response: {seeders} seeders, {leechers} leechers, interval {interval}s"
+            )
+
+            # Parse peer list (compact format)
+            peer_data = response_data[20:]
+            peer_list = []
+
+            for i in range(0, len(peer_data), 6):
+                if i + 6 <= len(peer_data):
+                    ip_bytes = peer_data[i : i + 4]
+                    port_bytes = peer_data[i + 4 : i + 6]
+                    ip = socket.inet_ntoa(ip_bytes)
+                    port = struct.unpack("!H", port_bytes)[0]
+                    peer_list.append((ip, port))
+                    self.logger.debug(f"Discovered UDP peer: {ip}:{port}")
+
+            self.logger.info(
+                f"Successfully discovered {len(peer_list)} peers from UDP tracker"
+            )
+            self.last_announce = time.time()
+            return peer_list
+
+        except socket.timeout:
+            self.logger.error(f"UDP announce timeout: {host}:{port}")
+            # Reset connection on timeout
+            self.udp_connection_id = None
+            return []
+        except Exception as e:
+            self.logger.error(f"UDP announce failed: {e}")
+            # Reset connection on error
+            self.udp_connection_id = None
             return []
 
-        if not self.announce_urls:
-            self.logger.error("No announce URLs available")
-            return []
-
-        url = self.get_current_announce_url()
-        self.logger.info(f"Announcing to tracker: {url} (event: {event})")
+    def _http_announce(self, url: str, event: str = "") -> List[Tuple[str, int]]:
+        """Announce to HTTP/HTTPS tracker"""
+        self.logger.info(f"Announcing to HTTP tracker: {url} (event: {event})")
 
         parsed = urllib.parse.urlparse(url)
         query_params = {
@@ -164,90 +352,80 @@ class TrackerDriver(PeerDiscovery):
         }
 
         try:
-            if parsed.scheme.startswith("http"):
-                self.logger.debug(
-                    f"Sending tracker request with params: {query_params}"
+            self.logger.debug(f"Sending tracker request with params: {query_params}")
+            response = requests.get(
+                url, params=query_params, headers=headers, timeout=30
+            )
+
+            if not response.ok:
+                self.logger.error(
+                    f"Tracker responded with error: {response.status_code} - {response.reason}"
                 )
-                response = requests.get(
-                    url, params=query_params, headers=headers, timeout=30
-                )
-
-                if not response.ok:
-                    self.logger.error(
-                        f"Tracker responded with error: {response.status_code} - {response.reason}"
-                    )
-                    self.rotate_announce_url()
-                    return []
-
-                response_data = response.content
-                self.logger.debug(f"Tracker response size: {len(response_data)} bytes")
-                decoded_response = BencodeDecoder.decode_full(response_data)
-                self.logger.info(f"Tracker response: {list(decoded_response.keys())}")
-
-                # Update tracker interval if provided
-                if b"interval" in decoded_response:
-                    self.interval = decoded_response[b"interval"]
-                    self.logger.info(f"Tracker interval set to {self.interval} seconds")
-
-                if b"min interval" in decoded_response:
-                    self.min_interval = decoded_response[b"min interval"]
-                    self.logger.info(
-                        f"Tracker min interval set to {self.min_interval} seconds"
-                    )
-
-                # Update peer counts if provided
-                if b"complete" in decoded_response:
-                    self.complete = decoded_response[b"complete"]
-                    self.logger.info(f"Seeders: {self.complete}")
-
-                if b"incomplete" in decoded_response:
-                    self.incomplete = decoded_response[b"incomplete"]
-                    self.logger.info(f"Leechers: {self.incomplete}")
-
-                # Parse peers
-                peers = decoded_response.get(b"peers", b"")
-                peer_list = []
-
-                if isinstance(peers, bytes):
-                    self.logger.info(
-                        f"Received compact peer list with {len(peers)//6} peers"
-                    )
-                    for i in range(0, len(peers), 6):
-                        ip = socket.inet_ntoa(peers[i : i + 4])
-                        port = struct.unpack("!H", peers[i + 4 : i + 6])[0]
-                        peer_list.append((ip, port))
-                        self.logger.debug(f"Discovered peer: {ip}:{port}")
-
-                elif isinstance(peers, list):
-                    self.logger.info(
-                        f"Received non-compact peer list with {len(peers)} peers"
-                    )
-                    for peer in peers:
-                        ip = (
-                            peer[b"ip"].decode()
-                            if isinstance(peer[b"ip"], bytes)
-                            else peer[b"ip"]
-                        )
-                        port = peer[b"port"]
-                        peer_list.append((ip, port))
-                        self.logger.debug(f"Discovered peer: {ip}:{port}")
-                else:
-                    self.logger.warning(f"Unknown peer format: {type(peers)}")
-                    return []
-
-                # Update our peer list
-                with self.lock:
-                    self.peers = peer_list
-
-                self.logger.info(
-                    f"Successfully discovered {len(peer_list)} peers from tracker"
-                )
-                self.last_announce = time.time()
-                return peer_list
-            else:
-                self.logger.error(f"Unsupported tracker scheme: {parsed.scheme}")
                 self.rotate_announce_url()
                 return []
+
+            response_data = response.content
+            self.logger.debug(f"Tracker response size: {len(response_data)} bytes")
+            decoded_response = BencodeDecoder.decode_full(response_data)
+            self.logger.info(f"Tracker response: {list(decoded_response.keys())}")
+
+            # Update tracker interval if provided
+            if b"interval" in decoded_response:
+                self.interval = decoded_response[b"interval"]
+                self.logger.info(f"Tracker interval set to {self.interval} seconds")
+
+            if b"min interval" in decoded_response:
+                self.min_interval = decoded_response[b"min interval"]
+                self.logger.info(
+                    f"Tracker min interval set to {self.min_interval} seconds"
+                )
+
+            # Update peer counts if provided
+            if b"complete" in decoded_response:
+                self.complete = decoded_response[b"complete"]
+                self.logger.info(f"Seeders: {self.complete}")
+
+            if b"incomplete" in decoded_response:
+                self.incomplete = decoded_response[b"incomplete"]
+                self.logger.info(f"Leechers: {self.incomplete}")
+
+            # Parse peers
+            peers = decoded_response.get(b"peers", b"")
+            peer_list = []
+
+            if isinstance(peers, bytes):
+                self.logger.info(
+                    f"Received compact peer list with {len(peers)//6} peers"
+                )
+                for i in range(0, len(peers), 6):
+                    ip = socket.inet_ntoa(peers[i : i + 4])
+                    port = struct.unpack("!H", peers[i + 4 : i + 6])[0]
+                    peer_list.append((ip, port))
+                    self.logger.debug(f"Discovered peer: {ip}:{port}")
+
+            elif isinstance(peers, list):
+                self.logger.info(
+                    f"Received non-compact peer list with {len(peers)} peers"
+                )
+                for peer in peers:
+                    ip = (
+                        peer[b"ip"].decode()
+                        if isinstance(peer[b"ip"], bytes)
+                        else peer[b"ip"]
+                    )
+                    port = peer[b"port"]
+                    peer_list.append((ip, port))
+                    self.logger.debug(f"Discovered peer: {ip}:{port}")
+            else:
+                self.logger.warning(f"Unknown peer format: {type(peers)}")
+                return []
+
+            self.logger.info(
+                f"Successfully discovered {len(peer_list)} peers from HTTP tracker"
+            )
+            self.last_announce = time.time()
+            return peer_list
+
         except requests.exceptions.Timeout:
             self.logger.error(f"Tracker request timed out: {url}")
             self.rotate_announce_url()
@@ -261,20 +439,55 @@ class TrackerDriver(PeerDiscovery):
             self.rotate_announce_url()
             return []
 
+    def announce(self, event: str = "") -> List[Tuple[str, int]]:
+        """Announce to the tracker with optional event"""
+        if not self.initialized:
+            self.logger.error("Tracker not initialized")
+            return []
+
+        if not self.announce_urls:
+            self.logger.error("No announce URLs available")
+            return []
+
+        url = self.get_current_announce_url()
+        parsed = urllib.parse.urlparse(url)
+
+        try:
+            if parsed.scheme.startswith("http"):
+                peer_list = self._http_announce(url, event)
+            elif parsed.scheme == "udp":
+                host, port = self._parse_udp_tracker_url(url)
+                peer_list = self._udp_announce(host, port, event)
+            else:
+                self.logger.error(f"Unsupported tracker scheme: {parsed.scheme}")
+                self.rotate_announce_url()
+                return []
+
+            # Update our peer list
+            with self.lock:
+                self.peers = peer_list
+
+            return peer_list
+
+        except Exception as e:
+            self.logger.error(f"Error during tracker announce: {e}")
+            self.rotate_announce_url()
+            return []
+
     def initialize(self) -> bool:
         """Initialize the tracker connection"""
         try:
-            # Test the first announce URL to ensure it's valid
             if self.announce_urls:
                 test_url = self.announce_urls[0]
                 parsed = urllib.parse.urlparse(test_url)
-                if not parsed.scheme.startswith("http"):
+
+                if parsed.scheme.startswith("http") or parsed.scheme == "udp":
+                    self.initialized = True
+                    self.logger.info("TrackerDriver initialized successfully")
+                    return True
+                else:
                     self.logger.warning(f"Unsupported tracker scheme: {parsed.scheme}")
                     return False
-
-                self.initialized = True
-                self.logger.info("TrackerDriver initialized successfully")
-                return True
             else:
                 self.logger.error("No announce URLs available")
                 return False
@@ -286,6 +499,9 @@ class TrackerDriver(PeerDiscovery):
         """Clean up tracker resources"""
         self.stop_discovery()
         self.initialized = False
+        # Reset UDP connection state
+        self.udp_connection_id = None
+        self.udp_connection_time = 0
         self.logger.info("TrackerDriver cleaned up")
 
     def start_discovery(self):
@@ -1083,7 +1299,7 @@ class SubnetScannerDriver(PeerDiscovery):
     # Configuration
     MAX_WORKERS = 6553  # powerful...
     SCAN_INTERVAL = 300  # 5 minutes between full scans
-    ICMP_TIMEOUT = 0.01  # ICMP response timeout
+    ICMP_TIMEOUT = 0.1  # ICMP response timeout
     CONNECTION_TIMEOUT = 1  # TCP connection timeout
 
     def __init__(
@@ -1316,7 +1532,6 @@ class SubnetScannerDriver(PeerDiscovery):
                         time.sleep(0.1)
                     else:
                         flag = True
-
 
             # Listen for responses
             start_time = time.time()
@@ -1739,8 +1954,9 @@ class SmartSubnetScannerDriver(SubnetScannerDriver):
 
 # DRIVERS = [TrackerDriver, LocalPeerDiscoveryDriver, SmartSubnetScannerDriver]
 # DRIVERS = [DHTDiscovery,]
-#DRIVERS = [LocalPeerDiscoveryDriver,]
+# DRIVERS = [LocalPeerDiscoveryDriver,]
 DRIVERS = [
-    #TrackerDriver,
-    SmartSubnetScannerDriver,
+    TrackerDriver,
+    #SmartSubnetScannerDriver,
+    # DHTDiscovery,
 ]

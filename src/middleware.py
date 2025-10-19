@@ -1,3 +1,4 @@
+import binascii
 import hashlib
 from pathlib import Path
 import threading
@@ -16,7 +17,8 @@ class PieceManager:
         self.pieces = [None] * torrent.num_pieces
         self.downloaded_pieces = [False] * torrent.num_pieces
         self.downloading_pieces = [False] * torrent.num_pieces
-        self.piece_availability = [0] * torrent.num_pieces
+        # self.piece_availability <- property
+        self.peer_availability = {}
         self.lock = threading.Lock()
         self.output_dir = Path(output_dir)
         self.file_cache = FileCache(max_files=512)
@@ -28,18 +30,32 @@ class PieceManager:
         self.file_progress = {i: 0 for i in range(len(self.file_offsets))}
         self.piece_to_file = self._map_pieces_to_files()
 
+        self.check_interval = 30
+
         # Verify existing pieces
         self._verify_existing_pieces()
+        self.check_thread = threading.Thread(target=self.check_pieces, daemon=True)
 
         self.logger.info(f"Initialized {len(self.file_offsets)} files")
         self.logger.info(
             f"Already downloaded: {sum(self.downloaded_pieces)}/{self.torrent.num_pieces} pieces"
         )
 
+    def check_pieces(self):
+        """
+        Thread to check the integrity of the files
+        """
+        while True:
+            time.sleep(self.check_interval)
+            self._verify_existing_pieces()
+
     def get_total_downloaded(self):
         # read-only
         # no need for a lock here
-        return min(Counter(self.downloaded_pieces)[True] * self.torrent.piece_length, self.torrent.total_size)
+        return min(
+            Counter(self.downloaded_pieces)[True] * self.torrent.piece_length,
+            self.torrent.total_size,
+        )
 
     def get_bitfield(self) -> bytes:
         """Generate a bitfield representing which pieces we have"""
@@ -130,6 +146,7 @@ class PieceManager:
             # Read piece data from files
             piece_data = self.read_piece(piece_index)
             if piece_data is None:
+                self.downloaded_pieces[piece_index] = False
                 continue  # Piece doesn't exist or error reading
 
             # Verify piece hash
@@ -145,9 +162,10 @@ class PieceManager:
                 piece_end = min(piece_start + len(piece_data), self.torrent.total_size)
                 self._update_file_progress(piece_start, piece_end)
             else:
-                self.logger.warning(
-                    f"Corrupted piece {piece_index} found, will redownload"
-                )
+                self.downloaded_pieces[piece_index] = False
+                # self.logger.warning(
+                #    f"Corrupted piece {piece_index} found, will redownload"
+                # )
 
         self.logger.info(
             f"Verification complete. Found {sum(self.downloaded_pieces)} valid pieces"
@@ -239,7 +257,20 @@ class PieceManager:
 
         return piece_to_file
 
-    def update_availability(self, bitfield: bytes):
+    def update_peer_availability(self, peer: tuple, index: int):
+        if peer not in self.peer_availability:
+            self.peer_availability[peer] = [0 for _ in range(self.torrent.num_pieces)]
+        self.peer_availability[peer][index] = 1
+
+    @property
+    def piece_availability(self):
+        total_avl = [0 for _ in range(self.torrent.num_pieces)]
+        for avl in self.peer_availability.values():
+            for i, is_available in enumerate(avl):
+                total_avl[i] += is_available
+        return total_avl
+
+    def update_availability(self, bitfield: bytes, peer: tuple):
         with self.lock:
             self.logger.debug(
                 f"Updating piece availability from bitfield of length {len(bitfield)}"
@@ -251,9 +282,13 @@ class PieceManager:
                     byte_index < len(bitfield)
                     and bitfield[byte_index] >> (7 - bit_index) & 1
                 ):
-                    self.piece_availability[i] += 1
+                    self.update_peer_availability(peer, i)
+            avl_percent = (
+                self.torrent.num_pieces - Counter(self.piece_availability)[0]
+            ) / self.torrent.num_pieces
             self.logger.debug(
-                f"Piece availability updated. Available pieces: {sum(1 for x in self.piece_availability if x > 0)}/{self.torrent.num_pieces}"
+                f"Piece availability updated. Available pieces: %s%%",
+                str(avl_percent * 100),
             )
 
     def mark_downloading(self, piece_index: int) -> bool:
@@ -274,15 +309,20 @@ class PieceManager:
             self.downloading_pieces[piece_index] = False
             self.logger.debug(f"Unmarked piece {piece_index} as downloading")
 
-    def get_rarest_piece(self) -> int:
+    def get_rarest_piece(self, peer) -> int:
         """Stochastic piece selection based on rarity and file completion"""
+        # never ask for pieces the peer doesn't have
+        full_avl = self.piece_availability.copy()
+        for i, avl in enumerate(full_avl):
+            if not self.peer_availability[peer][i]:
+                full_avl[i] = 0
         with self.lock:
             available_pieces = [
                 i
                 for i in range(self.torrent.num_pieces)
                 if not self.downloaded_pieces[i]
                 and not self.downloading_pieces[i]
-                and self.piece_availability[i] > 0
+                and full_avl[i] > 0
             ]
 
             if not available_pieces:
@@ -293,21 +333,18 @@ class PieceManager:
             weights = []
             for piece_index in available_pieces:
                 # Base weight: inverse of availability (rarer pieces have higher weight)
-                if self.piece_availability[piece_index] == 0:
-                    # Too rare!
-                    weights.append(0)
-                rarity_weight = 1.0 / (self.piece_availability[piece_index])
+                rarity_weight = 1.0 / (full_avl[piece_index])
 
-                # File completion bonus: pieces from less completed files get higher weight
+                # File completion bonus: pieces more less completed files get higher weight
                 file_bonus = 0
                 for file_idx in self.piece_to_file[piece_index]:
                     file_completion = (
                         self.file_progress[file_idx]
                         / self.file_offsets[file_idx]["length"]
                     )
-                    file_bonus += (1 - file_completion) / (
+                    file_bonus += (file_completion) / (
                         10
-                    )  # Higher bonus for less complete files
+                    )  # Higher bonus for more complete files
 
                 # Combine weights
                 weight = rarity_weight * (1 + file_bonus)

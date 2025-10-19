@@ -80,6 +80,11 @@ class PeerWireProtocol:
         self.bitfield = None
         self.handshake_done = False
         self.connection_timeout = 120  # 2 minutes timeout
+
+        self.total_downloaded = 0
+        self.total_uploaded = 0
+        self.is_incoming = False
+
         self.logger.debug(f"PeerWireProtocol initialized for {peer}")
 
     def __hash__(self):
@@ -106,6 +111,7 @@ class PeerWireProtocol:
             self.logger.info(f"Connecting to peer {self.peer}")
             self.socket.settimeout(10)
             self.socket.connect(self.peer)
+            self.socket.settimeout(self.connection_timeout)
             self.logger.info(f"Connected to peer {self.peer}")
             self._handshake()
             self.connected = True
@@ -174,6 +180,7 @@ class PeerWireProtocol:
         handshake_msg = (
             b"\x13BitTorrent protocol" + b"\x00" * 8 + self.info_hash + self.peer_id
         )
+        self.is_incoming = is_incoming
         try:
             if not is_incoming:
                 self.logger.debug(f"Sending handshake to {self.peer} (outgoing)")
@@ -213,6 +220,9 @@ class PeerWireProtocol:
         except Exception as e:
             self.logger.error(f"Handshake failed with {self.peer}: {e}")
             raise
+        finally:
+            # Set normal timeout after handshake
+            self.socket.settimeout(self.connection_timeout)
 
     def _recv_exact(self, n: int) -> bytes:
         """
@@ -236,12 +246,14 @@ class PeerWireProtocol:
             try:
                 chunk = self.socket.recv(n - len(data))
                 if not chunk:
-                    raise ConnectionError("Connection closed")
-                data += chunk
+                    self.close()
+                    raise ConnectionError(f"Connection closed ({self.peer})")
+                else:
+                    data += chunk
             except socket.timeout:
                 raise
             except Exception as e:
-                raise ConnectionError(f"Error receiving data: {e}")
+                raise ConnectionError(f"Error receiving data: {e}") from e
         return data
 
     def receive_message(self) -> Tuple[Optional[int], Optional[bytes]]:
@@ -270,7 +282,7 @@ class PeerWireProtocol:
 
             # Handle keep-alive messages
             if length == 0:
-                self.logger.debug("Received keep-alive message")
+                self.logger.debug("Received keep-alive message (%s)", self.peer)
                 return None, None
 
             # Read exactly 'length' bytes for the message body
@@ -283,10 +295,14 @@ class PeerWireProtocol:
 
             # Log error for unknown message types
             if message_id not in self.MESSAGE_NAMES:
-                self.logger.error(f"Received unknown message type: {message_id}")
+                self.logger.error(f"Received unknown message type: %s (%s)", message_id, self.peer)
             else:
+                if message_id == self.PIECE:
+                    # track
+                    # - 16 (II) maybe?
+                    self.total_downloaded += len(payload)
                 self.logger.debug(
-                    f"Received message: {message_name}, length: {length}, payload: {len(payload)} bytes"
+                    f"Received message: {message_name}, length: {length}, payload: {len(payload)} bytes ({self.peer})"
                 )
 
             return message_id, payload
@@ -371,6 +387,9 @@ class PeerWireProtocol:
     def send_piece(self, index: int, begin: int, block: bytes) -> bool:
         """Send a PIECE message with requested block data."""
         payload = struct.pack(">II", index, begin) + block
+
+        # track
+        self.total_uploaded += len(payload)
         return self.send_message(self.PIECE, payload)
 
     def send_cancel(self, index: int, begin: int, length: int) -> bool:

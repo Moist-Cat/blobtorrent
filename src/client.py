@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 import os
@@ -9,7 +10,7 @@ import socket
 from pathlib import Path
 
 from filesystem import TorrentFile
-from peer_drivers import DRIVERS
+from peer_drivers import DRIVERS, TrackerDriver
 from middleware import PieceManager
 from network.connection import (
     ConnectionManager,
@@ -35,6 +36,7 @@ class BitTorrentClientState(Enum):
 @logged
 class BitTorrentClient:
     version = "0.0.1"
+    state_enum = BitTorrentClientState
 
     def __init__(
         self,
@@ -63,14 +65,12 @@ class BitTorrentClient:
             self.state = BitTorrentClientState.ERROR
             return
 
-        # Initialize statistics
-        self.stats = Statistics(self.torrent)
-
         # Initialize piece manager
         self.piece_manager = PieceManager(self.torrent, output_dir)
 
-        # Initialize connection manager
+        # Initialize and bootstrap connection manager
         self.connection_manager = ConnectionManager()
+        self.bootstrap()
 
         # Configuration
         self.seed_after_download = seed_after_download
@@ -105,6 +105,38 @@ class BitTorrentClient:
         self.logger.info(f"Client initialized with port {self.port}")
         self.logger.info(f"Client peer ID: {binascii.hexlify(self.peer_id).decode()}")
 
+        # Initialize statistics
+        self.stats = Statistics(self)
+
+        threading.Thread(target=self._update_stats, daemon=True).start()
+
+    def bootstrap(self):
+        peers = self.load_peers(
+            binascii.hexlify(self.torrent.info_hash).decode()
+        )
+        for peer in peers:
+            connection = ActiveConnection(
+                tuple(peer), self.torrent, self.piece_manager, self.peer_id, is_seeder=False
+            )
+            if self.connection_manager.add_connection(connection):
+                connection.start()
+                self.logger.info(f"Started download connection to {peer} (bootstrap)")
+
+    def load_peers(self, info_hash):
+        if not Path(info_hash).exists():
+            self.save_peers(info_hash, [])
+        with open(info_hash, "r") as file:
+            peers = json.load(file)
+        return peers
+
+    def save_peers(self, info_hash, peers):
+        if not peers:
+            # avoid corrupting the bootstrap list
+            return peers
+        with open(info_hash, "w") as file:
+            json.dump(peers, file)
+        return peers
+
     def _allocate_port(self, preferred_port: Optional[int] = None) -> Optional[int]:
         """Allocate a port for the client to use"""
         port = self.port_manager.allocate_port(preferred_port)
@@ -120,40 +152,9 @@ class BitTorrentClient:
         return peer_id
 
     def _update_stats(self):
-        """Update client statistics with real data"""
-        current_time = time.time()
-
-        # Get actual downloaded bytes from piece manager
-        downloaded = self.piece_manager.get_total_downloaded()
-        self.stats.update_downloaded(downloaded)
-
-        uploaded = self.connection_manager.get_total_uploaded()
-        self.stats.update_uploaded(uploaded)
-
-        # Update peer counts
-        connected_peers = self.connection_manager.get_connection_count()
-        total_peers = len(self._get_all_peers())
-        seeders = self.connection_manager.get_seeder_count()
-        self.stats.update_peer_counts(connected_peers, total_peers, seeders)
-
-        # Update state based on client state
-        state_mapping = {
-            BitTorrentClientState.INITIALIZING: 0,
-            BitTorrentClientState.DISCOVERING_PEERS: 0,
-            BitTorrentClientState.DOWNLOADING: 1,
-            BitTorrentClientState.SEEDING: 2,
-            BitTorrentClientState.PAUSED: 0,
-            BitTorrentClientState.STOPPED: 0,
-            BitTorrentClientState.ERROR: 4
-        }
-        state_code = state_mapping[self.state]
-        self.stats.update_state(state_code)
-
-        # Update activity
-        self.stats.update_activity()
-
         # Log stats periodically
-        if int(current_time) % 10 == 0:
+        while True:
+            time.sleep(10)
             stats = self.stats.get_stats_dict()
             self.logger.info(
                 f"Stats: Progress: {stats['progress']:.1%}, "
@@ -289,9 +290,6 @@ class BitTorrentClient:
                 BitTorrentClientState.STOPPED,
                 BitTorrentClientState.ERROR,
             }:
-                # Update statistics
-                self._update_stats()
-
                 # State-specific processing
                 if self.state == BitTorrentClientState.DISCOVERING_PEERS:
                     self._handle_discovering_state()
@@ -307,6 +305,12 @@ class BitTorrentClient:
 
                 # Sleep to prevent busy waiting
                 time.sleep(1)
+                self.save_peers(
+                    binascii.hexlify(self.torrent.info_hash).decode(),
+                    list(self._get_all_peers()),
+                )
+                if not self.connection_manager.get_connection_count():
+                    self.bootstrap()
 
         except KeyboardInterrupt:
             self.logger.info("Client interrupted by user")
@@ -533,26 +537,24 @@ class TorrentManager:
 
     def get_torrents(self):
         """Get enhanced torrent statistics"""
-        # XXX might be a duplicate
         torrents = {}
         for info_hash, client in self.clients.items():
             stats = client.get_stats()
-            stats_dict = stats.get_stats_dict() if hasattr(stats, 'get_stats_dict') else stats
-            
-            # Ensure we have all required fields
-            torrents[info_hash] = stats_dict
-        
-        return torrents
-        return {
-            info_hash: client.get_stats() for info_hash, client in self.clients.items()
-        }
+            stats_dict = (
+                stats.get_stats_dict() if hasattr(stats, "get_stats_dict") else stats
+            )
 
-    def get_trackers(self, info_hash):
-        return []
+            torrents[binascii.hexlify(info_hash).decode()] = stats_dict
+
+        return torrents
 
     def perform_action(self, torrent_hash: str, action: str):
         """Perform action on torrent"""
-        pass
+        info_hash = binascii.unhexlify(torrent_hash)
+        client = self.clients[info_hash]
+        ALLOWED = {"pause", "resume", "stop"}
+        if action in ALLOWED:
+            getattr(client, action)()
 
 
 if __name__ == "__main__":
