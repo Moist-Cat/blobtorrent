@@ -10,7 +10,9 @@ logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(LOG_DIR / "bittorrent_client.log"),
+        logging.handlers.RotatingFileHandler(
+            LOG_DIR / "bittorrent_client.log", maxBytes=5000000, backupCount=1
+        ),
         logging.StreamHandler(),
     ],
 )

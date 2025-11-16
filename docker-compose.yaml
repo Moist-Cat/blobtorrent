@@ -33,6 +33,7 @@ services:
     build: .
     volumes:
       - ./torrent:/torrent:ro
+      - ./adapter:/adapter
       - ./src:/app
     networks:
       - blobtorrent-net
@@ -56,19 +57,6 @@ services:
         max-size: "10m"
         max-file: "3"
     command: ["python3", "api.py"]
-
-  # Control node for managing the swarm
-  control-node:
-    image: blobtorrent:latest
-    volumes:
-      - ./torrent:/torrent:ro
-      - ./scripts:/scripts
-    networks:
-      - blobtorrent-net
-    deploy:
-      placement:
-        constraints: [node.role == manager]
-    command: ["tail", "-f", "/dev/null"]
 
   # Monitoring and visualization
   monitor:

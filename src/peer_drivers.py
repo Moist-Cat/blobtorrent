@@ -335,6 +335,7 @@ class TrackerDriver(PeerDiscovery):
 
         parsed = urllib.parse.urlparse(url)
         query_params = {
+            #"info_hash": self.torrent.info_hash,
             "info_hash": self.torrent.info_hash,
             "peer_id": self.peer_id,
             "port": self.port,
@@ -424,6 +425,8 @@ class TrackerDriver(PeerDiscovery):
                 f"Successfully discovered {len(peer_list)} peers from HTTP tracker"
             )
             self.last_announce = time.time()
+            if not peer_list:
+                self.rotate_announce_url()
             return peer_list
 
         except requests.exceptions.Timeout:
@@ -1957,6 +1960,6 @@ class SmartSubnetScannerDriver(SubnetScannerDriver):
 # DRIVERS = [LocalPeerDiscoveryDriver,]
 DRIVERS = [
     TrackerDriver,
-    #SmartSubnetScannerDriver,
+    SmartSubnetScannerDriver,
     # DHTDiscovery,
 ]

@@ -1,4 +1,5 @@
 import binascii
+from collections import deque
 import queue
 from pathlib import Path
 import socket
@@ -107,7 +108,7 @@ class PeerConnection(threading.Thread):
 
     def is_alive(self):
         """Check if the connection is still active"""
-        #return self.running and self.protocol.connected
+        # return self.running and self.protocol.connected
         return self.running
 
     def close(self):
@@ -267,62 +268,115 @@ class ConnectionManager:
         return len(self.active_connections)
 
 
+BLOCK_SIZE = 2**14
+BASE_MAX_REQUESTS = 10
+
+
+def get_piece_length(torrent, piece_index):
+    piece_length = torrent.piece_length
+    if piece_index == torrent.num_pieces - 1:
+        piece_length = torrent.total_size - piece_index * torrent.piece_length
+    return piece_length
+
+
+def get_total_blocks(piece_length, block_size):
+    return math.ceil(piece_length / block_size)
+
+
+def get_start_block(begin, block_size):
+    return math.ceil(begin / block_size)
+
+
 @logged
 class DownloadHandler:
-    """Handles the downloading phase of a connection"""
+    """Asynchronous download handler with message buffering and pipelining"""
 
     def __init__(
         self,
-        protocol: PeerWireProtocol,
-        piece_manager: PieceManager,
-        torrent: TorrentFile,
+        protocol,
+        piece_manager,
+        torrent,
     ):
         self.protocol = protocol
         self.piece_manager = piece_manager
         self.torrent = torrent
         self.unchoked = False
         self.bitfield = None
-        self.current_piece = None
         self.paused = False
         self.wait_timeout = 90
-        self.sleep_time = 1
+        self.sleep_time = 0.1
 
-        # cache each block
+        # Async messaging
+        self.message_queue = queue.Queue()
+        self.expected_blocks: set = set()  # block_index
+        self.received_blocks: dict(int, bytes) = {}  # begin -> block_data
+        self.current_piece: int = None
+        self.reader_thread = None
+        self.shutdown = False
+
+        # Cache for partial pieces
         ih = binascii.hexlify(torrent.info_hash).decode()
         self.cache_dir = Path(f"/tmp/blobcache/{ih}/")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def load_piece(self, piece_index):
+        # aim for 10 pieces (160kb/s)
+        self.last_piece = time.time()
+        self.current_max_requests = BASE_MAX_REQUESTS
+        self.request_upper_bound = 64
+        self.request_lower_bound = 1
+        self.piece_count = 0
+
+    def penalize_max_requests(self):
+        new = self.current_max_requests // 2
+        self.current_max_requests = max(
+            self.request_lower_bound,
+            new,
+        )
+        self.logger.debug("Modified max requests to %d", self.current_max_requests)
+
+    def reward_max_requests(self):
+        self.current_max_requests = min(
+            self.request_upper_bound, self.current_max_requests + 1
+        )
+        self.logger.debug("Modified max requests to %d", self.current_max_requests)
+
+    def load_piece(self, piece_index: int) -> bytes:
+        """Load partially downloaded piece from cache"""
         piece_file = self.cache_dir / str(piece_index)
         if not piece_file.exists():
-            self.save_piece(piece_index)
+            self.save_piece(piece_index, b"")
         with open(piece_file, "rb") as file:
-            data = file.read()
-        return data
+            return file.read()
 
-    def save_piece(self, piece_index, data=b""):
+    def save_piece(self, piece_index: int, data: bytes):
+        """Save piece progress to cache"""
         piece_file = self.cache_dir / str(piece_index)
         with open(piece_file, "wb") as file:
             file.write(data)
-        return data
 
-    def invalidate_piece_cache(self, piece_index):
+    def invalidate_piece_cache(self, piece_index: int):
+        """Remove piece from cache"""
         piece_file = self.cache_dir / str(piece_index)
         if piece_file.exists():
             piece_file.unlink()
         else:
-            self.logging.warning(
-                "Tried to invalidate unexisting cache file for %d", piece_index
+            self.logger.warning(
+                "Tried to invalidate unexisting cache file for %s", str(piece_index)
             )
 
     def run(self):
-        """Execute the downloading protocol"""
-        self.logger.info(f"Starting download handler for {self.protocol.peer}")
+        """Execute the asynchronous downloading protocol"""
+        self.logger.info(f"Starting async download handler for {self.protocol.peer}")
 
         try:
+            # Start the message reader thread
+            self.reader_thread = threading.Thread(
+                target=self._message_reader, daemon=True
+            )
+            self.reader_thread.start()
+
             # Receive bitfield and update availability
-            self._receive_bitfield()
-            if self.bitfield is None:
+            if not self._receive_bitfield_async():
                 self.logger.warning(f"No bitfield received from {self.protocol.peer}")
                 return
 
@@ -330,201 +384,330 @@ class DownloadHandler:
             self.protocol.send_interested()
 
             # Wait for unchoke
-            self._wait_for_unchoke()
+            if not self._wait_for_unchoke_async():
+                self.logger.warning(
+                    f"Timeout waiting for unchoke from {self.protocol.peer}"
+                )
+                return
 
-            # Download pieces until complete
-            while not self.piece_manager.is_complete() and self.protocol.connected:
+            # Main download loop
+            while (
+                not self.piece_manager.is_complete()
+                and self.protocol.connected
+                and not self.shutdown
+            ):
                 if self.paused:
                     self.logger.debug("Paused...")
                     time.sleep(5)
                     continue
+
                 if not self.unchoked:
-                    self._wait_for_unchoke()
-                    continue
+                    if not self._wait_for_unchoke_async():
+                        self.logger.warning(f"Lost unchoke from {self.protocol.peer}")
+                        break
 
-                # Get a piece to download
-                piece_index = self.piece_manager.get_rarest_piece(self.protocol.peer)
-                if piece_index == -1:
-                    self.logger.info(
-                        f"No more pieces to download from {self.protocol.peer}"
-                    )
-                    break
+                # Process any pending messages
+                self._process_queued_messages()
 
-                # Try to reserve the piece
-                if not self.piece_manager.mark_downloading(piece_index):
-                    self.logger.debug(
-                        f"Piece {piece_index} already being downloaded, trying another"
-                    )
-                    time.sleep(0.1)
-                    continue
+                # Request new piece if needed as well
+                self._request_piece()
 
-                self.current_piece = piece_index
-                self.logger.info(
-                    f"Downloading piece {piece_index} from {self.protocol.peer}"
-                )
+                # Process received blocks and check for completion
+                self._process_received_blocks()
 
-                # Download the piece
-                success = self._download_piece(piece_index)
-
-                # Unreserve the piece if download failed
-                if not success:
-                    self.piece_manager.unmark_downloading(piece_index)
-                    self.current_piece = None
+                time.sleep(self.sleep_time)
 
         except Exception as e:
             self.logger.error(
-                f"Error in download handler for {self.protocol.peer}: {e}"
+                f"Error in async download handler for {self.protocol.peer}: {e}"
             )
-            if self.current_piece is not None:
-                self.piece_manager.unmark_downloading(self.current_piece)
         finally:
-            self.logger.info(f"Download handler for {self.protocol.peer} finished")
-
-    def _wait_for_unchoke(self):
-        """Wait for unchoke message with timeout"""
-        start_time = time.time()
-        while time.time() - start_time < self.wait_timeout:
-            msg_id, payload = self.protocol.receive_message()
-            if msg_id is None:
-                time.sleep(self.sleep_time)
-                continue
-
-            if msg_id == PeerWireProtocol.UNCHOKE:
-                self.unchoked = True
-                self.logger.info(f"Received UNCHOKE from {self.protocol.peer}")
-                return
-            elif msg_id == PeerWireProtocol.CHOKE:
-                self.unchoked = False
-                self.logger.info(f"Received CHOKE from {self.protocol.peer}")
-            elif msg_id == PeerWireProtocol.HAVE:
-                piece_index = struct.unpack(">I", payload)[0]
-                self.logger.debug(f"Received HAVE for piece {piece_index}")
-                # Update availability for this piece
-                with self.piece_manager.lock:
-                    if piece_index < len(self.piece_manager.piece_availability):
-                        self.piece_manager.piece_availability[piece_index] += 1
-
-        self.logger.warning(f"Timeout waiting for unchoke from {self.protocol.peer}")
-
-    def _receive_bitfield(self):
-        self.logger.info(f"Waiting for bitfield from {self.protocol.peer}")
-        start_time = time.time()
-        while time.time() - start_time < self.wait_timeout:
-            msg_id, payload = self.protocol.receive_message()
-            if msg_id is None:
-                time.sleep(self.sleep_time)
-                continue
-
-            if msg_id == PeerWireProtocol.BITFIELD:
-                self.bitfield = payload
-                self.logger.info(
-                    f"Received bitfield from {self.protocol.peer}, length: {len(payload)} bytes"
-                )
-                return
-            elif msg_id == PeerWireProtocol.UNCHOKE:
-                self.unchoked = True
-                self.logger.info(f"Received UNCHOKE from {self.protocol.peer}")
-            elif msg_id == PeerWireProtocol.CHOKE:
-                self.unchoked = False
-                self.logger.info(f"Received CHOKE from {self.protocol.peer}")
-            elif msg_id == PeerWireProtocol.HAVE:
-                piece_index = struct.unpack(">I", payload)[0]
-                self.logger.debug(f"Received HAVE for piece {piece_index}")
-
-        self.logger.warning(f"Timeout waiting for bitfield from {self.protocol.peer}")
-
-    def _download_piece(self, piece_index: int) -> bool:
-        piece_length = self.torrent.piece_length
-        if piece_index == self.torrent.num_pieces - 1:
-            piece_length = (
-                self.torrent.total_size - piece_index * self.torrent.piece_length
+            self.shutdown = True
+            # Clean up active pieces
+            self.logger.info(
+                f"Async download handler for {self.protocol.peer} finished"
             )
 
-        block_size = 2**14
-        num_blocks = math.ceil(piece_length / block_size)
-        # data = b""
-        data = self.load_piece(piece_index)
-        starting_index = math.ceil(len(data) / block_size)
+    def _message_reader(self):
+        """Dedicated thread to read all incoming messages"""
+        self.logger.debug(f"Starting message reader for {self.protocol.peer}")
+
+        while self.protocol.connected and not self.shutdown:
+            try:
+                msg_id, payload = self.protocol.receive_message()
+                if msg_id is not None:
+                    self.message_queue.put((msg_id, payload))
+                else:
+                    time.sleep(0.01)  # Small sleep when no message
+            except Exception as e:
+                self.logger.error(
+                    f"Error in message reader for {self.protocol.peer}: {e}"
+                )
+                break
+
+    def _process_queued_messages(self):
+        """Process all available messages in the queue"""
+        processed_count = 0
+        while not self.message_queue.empty() and processed_count < 50:
+            try:
+                msg_id, payload = self.message_queue.get_nowait()
+                self._handle_message(msg_id, payload)
+                processed_count += 1
+            except queue.Empty:
+                break
+
+    def _handle_message(self, msg_id: int, payload: bytes):
+        """Handle a single message"""
+        if msg_id == PeerWireProtocol.PIECE:
+            self._handle_piece_message(payload)
+        elif msg_id == PeerWireProtocol.UNCHOKE:
+            self.unchoked = True
+            self.logger.info(f"Received UNCHOKE from {self.protocol.peer}")
+        elif msg_id == PeerWireProtocol.CHOKE:
+            self.unchoked = False
+            self.penalize_max_requests()
+            self.logger.info(f"Received CHOKE from {self.protocol.peer}")
+            # Cancel all pending requests when choked
+            self.expected_blocks.clear()
+        elif msg_id == PeerWireProtocol.HAVE:
+            piece_index = struct.unpack(">I", payload)[0]
+            self.logger.debug(f"Received HAVE for piece {piece_index} (ignoring)")
+            self.piece_manager.update_peer_availability(self.protocol.peer, piece_index)
+            # Do not update availability
+            # Since when were you under the impression you could suggest pieces?
+        elif msg_id == PeerWireProtocol.BITFIELD:
+            self.logger.debug("Received BITFIELD")
+            self.bitfield = payload
+
+    def _handle_piece_message(self, payload: bytes):
+        """Handle a PIECE message"""
+        if len(payload) < 8:
+            self.logger.warning(f"Invalid PIECE message length: {len(payload)}")
+            return
+
+        index, begin = struct.unpack(">II", payload[:8])
+        block_data = payload[8:]
+
+        # Check if this is a block we're expecting
+        if index == self.current_piece and begin in self.expected_blocks:
+            block_type = "expected"
+            self.received_blocks[begin] = block_data
+            self.save_contiguous_block(begin)
+            self.expected_blocks.remove(begin)
+            self.reward_max_requests()
+        else:
+            block_type = "orphan"
+            self.save_contiguous_orphan(index, begin, block_data)
 
         self.logger.debug(
-            f"Downloading piece %d with %d blocks (already downloaded %d blocks)",
-            piece_index,
-            num_blocks,
-            starting_index,
+            "Received %s block %d:%d (%d bytes)",
+            block_type,
+            index,
+            begin,
+            len(block_data),
         )
 
-        for block_index in range(starting_index, num_blocks):
-            begin = block_index * block_size
-            block_length = min(block_size, piece_length - begin)
+    def save_contiguous_block(self, begin):
+        """
+        Save data while keeping the cache contiguous
+        """
+        data = self.load_piece(self.current_piece)
+        while begin == len(data) and begin in self.received_blocks:
+            block_data = self.received_blocks.pop(begin)
+            data += block_data
+            begin += len(block_data)
+            self.save_piece(self.current_piece, data)
 
-            self.protocol.send_request(piece_index, begin, block_length)
-            block_start_time = time.time()
-            block_received = False
+    def save_contiguous_orphan(self, index, begin, block_data):
+        if (
+            not self.piece_manager.mark_downloading(index)
+            and index != self.current_index
+        ):
+            self.logger.warning("Couldn't adopt orphan %d:%d", index, begin)
+            return
+        data = self.load_piece(index)
+        if begin == len(data):
+            data += block_data
+            self.save_piece(index, data)
+        else:
+            self.logger.warning(
+                "Couldn't adopt orphan %d:%d (non-contiguous block)", index, begin
+            )
 
-            while time.time() - block_start_time < self.wait_timeout:
-                msg_id, payload = self.protocol.receive_message()
+        self.piece_manager.unmark_downloading(index)
 
-                if msg_id is None:
-                    time.sleep(self.sleep_time)
-                    continue
+    def _receive_bitfield_async(self) -> bool:
+        """Wait for bitfield message asynchronously"""
+        self.logger.info(f"Waiting for bitfield from {self.protocol.peer}")
+        start_time = time.time()
 
-                if msg_id == PeerWireProtocol.PIECE:
-                    index, begin_offset = struct.unpack(">II", payload[:8])
-                    block_data = payload[8:]
-
-                    # Verify block index and offset
-                    if index != piece_index or begin_offset != begin:
-                        self.logger.warning(
-                            f"Received wrong block: expected {piece_index}:{begin}, got {index}:{begin_offset}"
-                        )
-                        return False  # Not the block we're waiting for
-
-                    # Critical: Check block length
-                    if len(block_data) != block_length:
-                        self.logger.warning(
-                            f"Incorrect block length: expected {block_length}, got {len(block_data)}"
-                        )
-                        return False
-
-                    data += block_data
-                    self.save_piece(piece_index, data)
-                    self.logger.debug(
-                        f"Received block {block_index+1}/{num_blocks} for piece {piece_index}"
-                    )
-                    block_received = True
-                    break
-                elif msg_id == PeerWireProtocol.CHOKE:
-                    self.unchoked = False
-                    self.logger.info(f"Choked by {self.protocol.peer} during download")
-                    return False
-                elif msg_id == PeerWireProtocol.UNCHOKE:
-                    self.unchoked = True
-                    self.logger.info(f"Unchoked by {self.protocol.peer}")
-                elif msg_id == PeerWireProtocol.HAVE:
-                    piece_idx = struct.unpack(">I", payload)[0]
-                    self.logger.debug(f"Received HAVE for piece {piece_idx}")
-
-            if not block_received:
-                self.logger.warning(
-                    f"Timeout downloading block {block_index} of piece {piece_index} from {self.protocol.peer}"
-                )
+        while time.time() - start_time < self.wait_timeout:
+            if self.shutdown or not self.protocol.connected:
                 return False
 
-        # Verify piece hash before saving
+            self._process_queued_messages()
+
+            if self.bitfield is not None:
+                return True
+
+            time.sleep(self.sleep_time)
+
+        self.logger.warning(f"Timeout waiting for bitfield from {self.protocol.peer}")
+        return False
+
+    def _wait_for_unchoke_async(self) -> bool:
+        """Wait for unchoke message asynchronously"""
+        start_time = time.time()
+
+        while time.time() - start_time < self.wait_timeout:
+            if self.shutdown or not self.protocol.connected:
+                return False
+
+            self._process_queued_messages()
+
+            if self.unchoked:
+                return True
+
+            time.sleep(self.sleep_time)
+
+        return False
+
+    def _request_piece(self):
+        """Request a piece to download"""
+        if not self.current_piece:
+            piece_index = self.piece_manager.get_rarest_piece(self.protocol.peer)
+            if piece_index == -1:
+                # we are (supposedly) done
+                # wait for the others
+                time.sleep(10)
+                return
+            # Try to reserve the piece
+            if not self.piece_manager.mark_downloading(piece_index):
+                self.logger.debug(f"Piece {piece_index} already being downloaded")
+                return
+            self.current_piece = piece_index
+
+        self.logger.info(
+            "Downloading piece %s from %s",
+            self.current_piece,
+            self.protocol.peer,
+        )
+
+        # Initialize piece data and request first blocks
+        self._initialize_piece_download(self.current_piece)
+
+    def _initialize_piece_download(self, piece_index: int):
+        """Initialize downloading of a piece and request initial blocks"""
+        # Load existing data
+        data = self.load_piece(piece_index)
+        if not self.expected_blocks:
+            begin = len(data)
+        else:
+            begin = max(self.expected_blocks) + BLOCK_SIZE
+        start_block = get_start_block(begin, BLOCK_SIZE)
+
+        # Calculate blocks needed
+        piece_length = get_piece_length(self.torrent, piece_index)
+
+        total_blocks = get_total_blocks(piece_length, BLOCK_SIZE)
+
+        self.logger.debug(
+            f"Initializing piece %s with %s blocks "
+            f"(already have %s bytes (requested: %s blocks))",
+            piece_index,
+            total_blocks,
+            len(data),
+            len(self.expected_blocks),
+        )
+        max_requests = self.current_max_requests - len(self.expected_blocks)
+        if max_requests == 0 or total_blocks - start_block == 0:
+            self.logger.debug("Download queue is full")
+            time.sleep(1)
+            return
+
+        requested_count = 0
+        for block_index in range(start_block, total_blocks):
+            if requested_count >= max_requests:
+                break
+
+            begin = block_index * BLOCK_SIZE
+            block_length = min(BLOCK_SIZE, piece_length - begin)
+
+            # Skip if already requested or received
+            if (
+                block_index in self.expected_blocks
+                or block_index in self.received_blocks
+            ):
+                self.logger.warning("Received non-contiguous block %s", block_index)
+                continue
+
+            self.protocol.send_request(piece_index, begin, block_length)
+            self.expected_blocks.add(begin)
+            requested_count += 1
+
+    def _process_received_blocks(self):
+        """Process received blocks and check for piece completion"""
+        if self.received_blocks or self.expected_blocks:
+            # We verify the piece so all of these
+            # are ours
+            return
+
+        if self._is_piece_complete(self.current_piece):
+            self._finalize_piece(self.current_piece)
+
+    def _is_piece_complete(self, piece_index: int) -> bool:
+        """Check if a piece is complete based on received blocks"""
+        piece_length = get_piece_length(self.torrent, piece_index)
+
+        # Load current data
+        data = self.load_piece(piece_index)
+
+        return len(data) == piece_length
+
+    def _finalize_piece(self, piece_index: int):
+        """Finalize a completed piece - verify and save"""
+        # Assemble final piece data
+        data = self.load_piece(piece_index)
+
+        # Verify piece hash
         computed_hash = hashlib.sha1(data).digest()
         expected_hash = self.torrent.piece_hashes[piece_index]
-        # self.invalidate_piece_cache(piece_index)
-        if computed_hash != expected_hash:
-            self.logger.error(
-                f"Hash mismatch for piece {piece_index}. Expected {expected_hash.hex()}, got {computed_hash.hex()}"
-            )
-            return False
 
+        if computed_hash != expected_hash:
+            self.logger.error(f"Hash mismatch for piece {piece_index}")
+            self._cleanup_piece()
+            return
+
+        # Save to piece manager
         self.piece_manager.save_piece(piece_index, data)
         self.logger.info(
-            f"Successfully downloaded and verified piece {piece_index} from {self.protocol.peer}"
+            f"Successfully downloaded piece {piece_index} from {self.protocol.peer}"
         )
-        return True
+
+        # Clean up
+        self._cleanup_piece()
+
+    def _cleanup_piece(self):
+        """Clean up resources for a piece"""
+        # sanity check
+        self.expected_blocks.clear()
+        self.received_blocks.clear()
+
+        # Unmark in piece manager
+        if self.current_piece:
+            self.piece_manager.unmark_downloading(self.current_piece)
+
+        # Clean cache
+        self.invalidate_piece_cache(self.current_piece)
+
+        # Remove from active pieces
+        self.current_piece = None
+
+    def stop(self):
+        """Stop the download handler"""
+        self.shutdown = True
+        if self.reader_thread and self.reader_thread.is_alive():
+            self.reader_thread.join(timeout=5.0)
 
 
 @logged

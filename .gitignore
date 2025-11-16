@@ -2,6 +2,7 @@
 torrent/
 out/
 log/
+adapter/socks/
 
 # vim
 *~
@@ -10,5 +11,3 @@ log/
 
 # py
 **/__pycache__/*
-
-dns/

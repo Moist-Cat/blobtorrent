@@ -4,6 +4,7 @@ from pathlib import Path
 import threading
 from typing import Tuple, Any
 import random
+import time
 
 from collections import Counter
 from filesystem import FileCache, TorrentFile
@@ -35,6 +36,7 @@ class PieceManager:
         # Verify existing pieces
         self._verify_existing_pieces()
         self.check_thread = threading.Thread(target=self.check_pieces, daemon=True)
+        self.check_thread.start()
 
         self.logger.info(f"Initialized {len(self.file_offsets)} files")
         self.logger.info(
@@ -90,13 +92,15 @@ class PieceManager:
             root_path.mkdir(parents=True, exist_ok=True)
 
             for file_info in self.torrent.info[b"files"]:
-                file_path = root_path / Path(*[p.decode() for p in file_info[b"path"]])
+                tail = Path(*[p.decode() for p in file_info[b"path"]])
+                file_path = root_path / tail
                 file_path.parent.mkdir(parents=True, exist_ok=True)
 
                 file_size = file_info[b"length"]
                 file_offsets.append(
                     {
                         "path": file_path,
+                        "tail": tail,
                         "offset": current_offset,
                         "length": file_size,
                         "completed": False,
@@ -115,12 +119,14 @@ class PieceManager:
                 current_offset += file_size
         else:
             # Single-file torrent
+            tail = self.torrent.info[b"name"].decode()
             file_path = self.output_dir / self.torrent.info[b"name"].decode()
             file_size = self.torrent.info[b"length"]
 
             file_offsets.append(
                 {
                     "path": file_path,
+                    "tail": tail,
                     "offset": 0,
                     "length": file_size,
                     "completed": False,
@@ -258,9 +264,12 @@ class PieceManager:
         return piece_to_file
 
     def update_peer_availability(self, peer: tuple, index: int):
-        if peer not in self.peer_availability:
-            self.peer_availability[peer] = [0 for _ in range(self.torrent.num_pieces)]
-        self.peer_availability[peer][index] = 1
+        with self.lock:
+            if peer not in self.peer_availability:
+                self.peer_availability[peer] = [
+                    0 for _ in range(self.torrent.num_pieces)
+                ]
+            self.peer_availability[peer][index] = 1
 
     @property
     def piece_availability(self):
@@ -271,28 +280,31 @@ class PieceManager:
         return total_avl
 
     def update_availability(self, bitfield: bytes, peer: tuple):
-        with self.lock:
-            self.logger.debug(
-                f"Updating piece availability from bitfield of length {len(bitfield)}"
-            )
-            for i in range(self.torrent.num_pieces):
-                byte_index = i // 8
-                bit_index = i % 8
-                if (
-                    byte_index < len(bitfield)
-                    and bitfield[byte_index] >> (7 - bit_index) & 1
-                ):
-                    self.update_peer_availability(peer, i)
-            avl_percent = (
-                self.torrent.num_pieces - Counter(self.piece_availability)[0]
-            ) / self.torrent.num_pieces
-            self.logger.debug(
-                f"Piece availability updated. Available pieces: %s%%",
-                str(avl_percent * 100),
-            )
+        self.logger.debug(
+            f"Updating piece availability from bitfield of length {len(bitfield)}"
+        )
+        for i in range(self.torrent.num_pieces):
+            byte_index = i // 8
+            bit_index = i % 8
+            if (
+                byte_index < len(bitfield)
+                and bitfield[byte_index] >> (7 - bit_index) & 1
+            ):
+                self.update_peer_availability(peer, i)
+        avl_percent = (
+            self.torrent.num_pieces - Counter(self.piece_availability)[0]
+        ) / self.torrent.num_pieces
+        self.logger.debug(
+            f"Piece availability updated. Available pieces: %s%%",
+            str(avl_percent * 100),
+        )
 
     def mark_downloading(self, piece_index: int) -> bool:
         """Mark a piece as being downloaded. Returns True if successful, False if already downloading."""
+        if self.is_endgame():
+            # free-for-all!
+            return True
+
         with self.lock:
             if (
                 self.downloading_pieces[piece_index]
@@ -309,6 +321,9 @@ class PieceManager:
             self.downloading_pieces[piece_index] = False
             self.logger.debug(f"Unmarked piece {piece_index} as downloading")
 
+    def is_endgame(self):
+        return Counter(self.downloaded_pieces)[False] <= 3
+
     def get_rarest_piece(self, peer) -> int:
         """Stochastic piece selection based on rarity and file completion"""
         # never ask for pieces the peer doesn't have
@@ -317,11 +332,13 @@ class PieceManager:
             if not self.peer_availability[peer][i]:
                 full_avl[i] = 0
         with self.lock:
+            if self.is_endgame():
+                self.logger.info("Endgame mode! Duplicate downloads no longer matter!")
             available_pieces = [
                 i
                 for i in range(self.torrent.num_pieces)
                 if not self.downloaded_pieces[i]
-                and not self.downloading_pieces[i]
+                and (not self.downloading_pieces[i] or self.is_endgame())
                 and full_avl[i] > 0
             ]
 

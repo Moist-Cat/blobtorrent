@@ -1,0 +1,1 @@
+delet peers from stats on disconnect--that is, when they are no longer in the connection manager

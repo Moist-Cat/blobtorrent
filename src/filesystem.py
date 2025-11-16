@@ -7,7 +7,7 @@ import threading
 from collections import OrderedDict
 
 from log import logged, master as logger
-
+from config import BASE_DIR
 
 class BencodeDecoder:
     @staticmethod
@@ -133,11 +133,16 @@ class FileCache:
 @logged
 class TorrentFile:
     def __init__(self, filepath: str):
-        self.filepath = filepath
         self.logger.info(f"Loading torrent file: {filepath}")
         try:
-            with open(filepath, "rb") as f:
-                data = f.read()
+            if isinstance(filepath, (str, Path)):
+                self.filepath = filepath
+                with open(filepath, "rb") as f:
+                    data = f.read()
+            else:
+                # raw torrent
+                self.filepath = None
+                data = filepath
             self.logger.info(f"Torrent file size: {len(data)} bytes")
 
             self.metadata = BencodeDecoder.decode_full(data)
@@ -171,6 +176,14 @@ class TorrentFile:
                 self.announce = None
 
             self.name = self.info.get(b"name", b"Unknown").decode()
+            self.comment = self.metadata.get(b"comment", b"").decode()
+            self.creation_date = self.metadata.get(b"creation date")
+
+            if self.filepath is None:
+                self.filepath = BASE_DIR / "torrent" / f"{self.name}.torrent"
+                if not self.filepath.exists() and data is not None:
+                    with open(self.filepath, "wb") as file:
+                        file.write(data)
 
             self.logger.info(f"Total size: {self.total_size} bytes")
             self.logger.info(f"Piece length: {self.piece_length} bytes")

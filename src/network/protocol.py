@@ -251,6 +251,7 @@ class PeerWireProtocol:
                 else:
                     data += chunk
             except socket.timeout:
+                self.close()
                 raise
             except Exception as e:
                 raise ConnectionError(f"Error receiving data: {e}") from e
@@ -295,7 +296,9 @@ class PeerWireProtocol:
 
             # Log error for unknown message types
             if message_id not in self.MESSAGE_NAMES:
-                self.logger.error(f"Received unknown message type: %s (%s)", message_id, self.peer)
+                self.logger.error(
+                    f"Received unknown message type: %s (%s)", message_id, self.peer
+                )
             else:
                 if message_id == self.PIECE:
                     # track

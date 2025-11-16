@@ -7,8 +7,10 @@ RUN apt-get update && apt-get install -y \
     iputils-ping \
     dnsutils \
     vim \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+    curl
+
+RUN apt-get update && apt-get install python3-dev -y
+RUN apt-get install gcc -y
 
 # Create app directory
 WORKDIR /app
@@ -17,15 +19,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-# Create directories for data and logs
-RUN mkdir /out/ /log/
 
-# Copy original data
-COPY ./out/ /out/
+# Adapter
+COPY adapter/requirements.txt requirements.adapter.txt
+RUN pip install -r requirements.adapter.txt
 
-# Entrypoint script
-COPY entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/entrypoint.sh
+RUN mkdir /log /out
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["--help"]
+COPY entrypoint.sh /

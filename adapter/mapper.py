@@ -1,8 +1,10 @@
 # method_mapper.py
+import base64
 import logging
 from typing import Any, List, Dict, Optional
 import requests
 import json
+import inspect
 
 # Configure logging
 logging.basicConfig(level=0)
@@ -19,6 +21,10 @@ class MethodMapper:
     ) -> Any:
         """Generic method to call the backend API with proper error handling"""
         url = f"{self.backend_url}/{endpoint.lstrip('/')}"
+        data = data or {}
+        if "info_hash" in data:
+            # comp with rTorrent and flood
+            data["info_hash"] = data["info_hash"]
 
         try:
             logger.debug(f"Backend API call: {method} {url} - Data: {data}")
@@ -49,6 +55,7 @@ class MethodMapper:
     def _dispatch(self, method: str, params: List) -> Any:
         """Main dispatch method that handles all XML-RPC calls"""
         real_method = method.replace(".", "_")
+        params = list(params)
         logger.info(f"XML-RPC call: {method} with params: {params}")
 
         if not hasattr(self, real_method):
@@ -56,7 +63,11 @@ class MethodMapper:
             raise Exception(f"Method {method} not supported")
 
         try:
-            result = getattr(self, real_method)(*params)
+            method_fun = getattr(self, real_method)
+            arg_names = list(inspect.signature(method_fun)._parameters)
+            if "info_hash" in arg_names:
+                params[arg_names.index("info_hash")] = params[arg_names.index("info_hash")].lower()
+            result = method_fun(*params)
             logger.info(f"XML-RPC result for {method}: {result}")
             return result
         except Exception as e:
@@ -65,14 +76,13 @@ class MethodMapper:
 
     # System methods
     def _listMethods(self) -> List[str]:
-        """Return list of available methods - Flood expects this"""
+        """Return list of available methods"""
         methods = [
             # System methods
             "system.listMethods",
             "system.methodSignature",
             "system.methodHelp",
-            #'system.multicall',
-
+            "system.multicall",
             # Torrent listing and info
             "d.multicall2",
             "d.name",
@@ -135,26 +145,32 @@ class MethodMapper:
             "f.size_bytes",
             "f.completed_chunks",
             "f.size_chunks",
-            #'f.priority', 'f.set_priority',
+            'f.priority',
+            #'f.set_priority',
             # Peer methods
             "p.multicall",
             "p.address",
             "p.up_rate",
             "p.down_rate",
             "p.is_incoming",
-
             # Tracker methods
-            't.multicall', 't.url', 't.is_enabled', "t.type",
+            "t.multicall",
+            "t.url",
+            "t.is_enabled",
+            "t.type",
             #'t.scrape_complete',
             #'t.scrape_incomplete', 't.scrape_downloaded', 't.group',
             #'t.id', 't.type', 't.is_open', 't.is_usable', 't.is_busy',
             #'t.is_extra', 't.min_interval', 't.normal_interval',
             #'t.scrape_time_last', 't.scrape_state', 't.announce_state',
-            #'t.announce_time_last', 't.url',
-
+            #'t.announce_time_last'
             # Add torrent methods
-            #'load.start', 'load.normal', 'load.raw', 'load.raw_start',
-            #'load.raw_verbose', 'load.raw_upload',
+            "load.start",
+            "load.normal",
+            "load.raw",
+            "load.raw_start",
+            "load.raw_verbose",
+            "load.raw_upload",
         ]
         logger.debug(f"Returning {len(methods)} available methods")
         return methods
@@ -187,11 +203,10 @@ class MethodMapper:
                 results.append({"faultCode": 1, "faultString": str(e)})
         return results
 
-    # Main torrent listing method - CRITICAL for Flood
+    # Main torrent listing method
     def d_multicall2(self, view: str, *args: str) -> List[List[Any]]:
         """
         Main method Flood uses to get torrent lists
-        This is the most important method for Flood compatibility
         """
         logger.info(f"d.multicall2 called with view: {view}, args: {args}")
 
@@ -212,11 +227,6 @@ class MethodMapper:
             for method_call in args[1:]:
                 # Remove trailing = if present (Flood sometimes adds it)
                 method_clean = method_call.rstrip("=")
-                if method_clean != "false":
-                    logger.debug(
-                        f"Processing method: {method_clean} for torrent {info_hash}"
-                    )
-
                 try:
                     if method_clean.startswith("cat="):
                         # Handle complex cat expressions (usually for trackers)
@@ -266,7 +276,7 @@ class MethodMapper:
         """Enhanced mapping with all required Flood fields"""
         mapping = {
             # Basic info
-            "d.hash": torrent.get("info_hash", ""),
+            "d.hash": torrent.get("info_hash", "").upper(),
             "d.name": torrent.get("name", "Unknown"),
             "d.base_path": torrent.get("base_path", ""),
             "d.base_filename": torrent.get("base_filename", "Unknown"),
@@ -302,7 +312,7 @@ class MethodMapper:
             "d.is_open": 1,
             "d.is_multi_file": 1,
             # Additional fields
-            "d.creation_date": str(torrent.get("added_time", 0)),
+            "d.creation_date": str(torrent.get("creation_date", 0)),
             "d.priority": 1,
             "d.local_id": torrent.get("info_hash", "")[:8],
             "d.connection_current": f"↓{torrent.get('down_rate', 0):.0f}/↑{torrent.get('up_rate', 0):.0f}",
@@ -310,7 +320,8 @@ class MethodMapper:
             "d.connection_seed": "seed" if torrent.get("is_complete") else "leech",
             "d.tied_to_file": torrent.get("download_path", ""),
             "d.custom1": "",
-            "d.custom2": "",
+            # rTorrent compatibility
+            "d.custom2": "VRS24mrker" + torrent.get("comment", ""),
             "d.ignore_commands": 0,
             "d.hashing": 0,
             "d.bitfield": "",
@@ -382,7 +393,7 @@ class MethodMapper:
     def d_erase(self, info_hash: str) -> int:
         """Remove torrent"""
         result = self.call_backend(
-            f"/api/torrents/{info_hash}", "DELETE", {"delete_files": False}
+            f"/api/torrents/{info_hash}/remove", "POST", {"delete_files": False}
         )
         return 1 if result else 0
 
@@ -436,7 +447,7 @@ class MethodMapper:
         return 0
 
     # File methods
-    def f_multicall(self, info_hash: str, *args: str) -> List[List[Any]]:
+    def f_multicall(self, info_hash: str, view: str, *args: str) -> List[List[Any]]:
         """File multicall - simplified implementation"""
         files_data = self.call_backend(f"/api/torrents/{info_hash}", "GET")
         files = files_data.get("files", []) if files_data else []
@@ -444,12 +455,8 @@ class MethodMapper:
         result = []
         for file_index, file_info in enumerate(files):
             file_result = []
-            for method in args[1:]:
+            for method in args:
                 method_clean = method.rstrip("=")
-                if method_clean != "false":
-                    logger.debug(
-                        f"Processing method: {method_clean} for torrent {info_hash}"
-                    )
                 value = self._map_file_method(method_clean, file_info, file_index)
                 file_result.append(value)
             result.append(file_result)
@@ -478,10 +485,6 @@ class MethodMapper:
             peer_result = []
             for method in args[1:]:
                 method_clean = method.rstrip("=")
-                if method_clean != "false":
-                    logger.debug(
-                        f"Processing method: {method_clean} for torrent {info_hash}"
-                    )
                 value = self._map_peer_method(method_clean, peer)
                 peer_result.append(value)
             result.append(peer_result)
@@ -509,10 +512,6 @@ class MethodMapper:
             tracker_result = []
             for method in args[1:]:
                 method_clean = method.rstrip("=")
-                if method_clean != "false":
-                    logger.debug(
-                        f"Processing method: {method_clean} for torrent {info_hash}"
-                    )
                 value = self._map_tracker_method(method_clean, tracker)
                 tracker_result.append(value)
             result.append(tracker_result)
@@ -558,6 +557,23 @@ class MethodMapper:
 
         success = result is not None
         logger.info(f"load_start result: {'success' if success else 'failed'}")
+        return 1 if success else 0
+
+    def load_raw_start(self, *args):
+        data = args[1].data
+        download_dir = args[4].split("=")[-1]
+        logger.info(f"load_start called with data length: {len(data)}, args: {args}")
+
+        torrent_b64 = base64.b64encode(
+            data.encode() if isinstance(data, str) else data
+        ).decode()
+
+        result = self.call_backend(
+            "api/torrents",
+            "POST",
+            {"torrent": torrent_b64, "download_dir": ""},
+        )
+
         return 1 if success else 0
 
     # Alias for load.start

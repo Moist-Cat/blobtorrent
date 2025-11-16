@@ -35,7 +35,7 @@ class BitTorrentClientState(Enum):
 
 @logged
 class BitTorrentClient:
-    version = "0.0.1"
+    version = "0.1.0"
     state_enum = BitTorrentClientState
 
     def __init__(
@@ -106,17 +106,19 @@ class BitTorrentClient:
         self.logger.info(f"Client peer ID: {binascii.hexlify(self.peer_id).decode()}")
 
         # Initialize statistics
-        self.stats = Statistics(self)
+        self.stats = Statistics(self, str(Path(self.output_dir / self.torrent.name).resolve()))
 
         threading.Thread(target=self._update_stats, daemon=True).start()
 
     def bootstrap(self):
-        peers = self.load_peers(
-            binascii.hexlify(self.torrent.info_hash).decode()
-        )
+        peers = self.load_peers(binascii.hexlify(self.torrent.info_hash).decode())
         for peer in peers:
             connection = ActiveConnection(
-                tuple(peer), self.torrent, self.piece_manager, self.peer_id, is_seeder=False
+                tuple(peer),
+                self.torrent,
+                self.piece_manager,
+                self.peer_id,
+                is_seeder=False,
             )
             if self.connection_manager.add_connection(connection):
                 connection.start()
@@ -124,7 +126,8 @@ class BitTorrentClient:
 
     def load_peers(self, info_hash):
         if not Path(info_hash).exists():
-            self.save_peers(info_hash, [])
+            with open(info_hash, "w") as file:
+                json.dump([], file)
         with open(info_hash, "r") as file:
             peers = json.load(file)
         return peers
@@ -264,6 +267,33 @@ class BitTorrentClient:
         peers = list(self._get_all_peers())
         self._start_seeding(peers)
 
+    def _transition_to_downloading(self):
+        """Transition from seeding to downloading state (possibly due to a corrupt file)"""
+        if self.piece_manager.is_complete():
+            self.logger.warning("Cannot transition to download: download complete")
+            return
+
+        self.connection_manager.close_all()
+        # more downloading connections
+        self.connection_manager.max_connections = 50
+        # we could reload but I chose not to
+        self.peer_server.stop()
+        self.peer_server = PeerServer(
+            self.port,
+            self.torrent,
+            self.peer_id,
+            self.piece_manager,
+            self.connection_manager,
+            # will change later
+            False,
+        )
+
+        self.logger.info("File is incomplete/corrupt, transitioning to downloading state")
+
+        # Get peers for downloading
+        peers = list(self._get_all_peers())
+        self._start_downloading(peers)
+
     def start(self):
         """Start the client"""
         if self.state == BitTorrentClientState.ERROR:
@@ -385,6 +415,11 @@ class BitTorrentClient:
                 if self.connection_manager.add_connection(connection):
                     connection.start()
                     self.logger.info(f"Started seed connection to {peer}")
+        if not self.piece_manager.is_complete():
+            # what the heck happened?
+            # try to download the file once again
+            self._transition_to_download()
+
 
     def _handle_paused_state(self):
         """Handle the paused state"""
@@ -484,6 +519,9 @@ class BitTorrentClient:
 
         self.logger.info("Client cleanup complete")
 
+    def check_hash(self):
+        return self.piece_manager._verify_existing_pieces()
+
     def get_stats(self) -> Dict[str, Any]:
         """Get current client statistics"""
         return self.stats.get_stats_dict()
@@ -523,17 +561,25 @@ class TorrentManager:
         self.client_threads = {}
         for torrent in torrents:
             # port is allocated automatically
-            client = BitTorrentClient(torrent, self.out_dir)
-            thread = threading.Thread(target=client.start, daemon=True)
-            self.client_threads[client.torrent.info_hash] = thread
-            self.clients[client.torrent.info_hash] = client
+            self.add_torrent(torrent, self.out_dir)
 
-            self.logger.info("Found torrent %s", client)
-            thread.start()
+    def add_torrent(self, torrent: str, download_dir: str) -> str:
+        client = BitTorrentClient(
+            torrent,
+            download_dir if download_dir else self.out_dir
+        )
+        ih = client.torrent.info_hash
+        thread = threading.Thread(target=client.start, daemon=True)
 
-    def add_torrent(self, torrent_data: str, download_dir: str) -> str:
-        """Add torrent from base64 or magnet URI"""
-        pass
+        self.clients[ih] = client
+        self.client_threads[ih] = thread
+        self.logger.info("Added torrent %s", client)
+        thread.start()
+
+    def remove_torrent(self, info_hash, delete_files: bool):
+        ih = binascii.unhexlify(info_hash)
+        del self.clients[ih]
+        del self.client_threads[ih]
 
     def get_torrents(self):
         """Get enhanced torrent statistics"""
@@ -548,11 +594,11 @@ class TorrentManager:
 
         return torrents
 
-    def perform_action(self, torrent_hash: str, action: str):
+    def perform_action(self, action: str, info_hash: str):
         """Perform action on torrent"""
-        info_hash = binascii.unhexlify(torrent_hash)
+        info_hash = binascii.unhexlify(info_hash)
         client = self.clients[info_hash]
-        ALLOWED = {"pause", "resume", "stop"}
+        ALLOWED = {"pause", "resume", "stop", "check_hash"}
         if action in ALLOWED:
             getattr(client, action)()
 

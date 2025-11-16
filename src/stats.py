@@ -3,8 +3,10 @@ import time
 from typing import Dict, Any, List
 from dataclasses import dataclass, field
 from collections import deque
+from pathlib import Path
 
 from peer_drivers import TrackerDriver
+
 
 def calculate_speed(
     last_update,
@@ -29,7 +31,9 @@ def calculate_speed(
     for i in range(len(dq) - 1):
         before, after = dq[i], dq[i + 1]
         deltas.append(after - before)
-    return sum(deltas) / (len(deltas) * slice_size)
+    # the calculated value could be negative
+    # if we disconnected and reconnected
+    return max(sum(deltas) / (len(deltas) * slice_size), 0)
 
 
 @dataclass
@@ -85,10 +89,16 @@ class Peer:
     def update_speeds(self, down_total, up_total, current_time):
 
         self.down_rate = calculate_speed(
-            self.last_update, current_time, self.last_downloaded, down_total,
+            self.last_update,
+            current_time,
+            self.last_downloaded,
+            down_total,
         )
         self.up_rate = calculate_speed(
-            self.last_update, current_time, self.last_uploaded, up_total,
+            self.last_update,
+            current_time,
+            self.last_uploaded,
+            up_total,
         )
         self.last_update = current_time
 
@@ -101,6 +111,7 @@ class ClientStats:
     info_hash: bytes
     name: str
     size_bytes: int
+    comment: str
 
     # Progress and transfer stats
     completed_bytes: int = 0
@@ -181,6 +192,7 @@ class ClientStats:
             else self.info_hash,
             "name": self.name,
             "size_bytes": self.size_bytes,
+            "comment": self.comment,
             # Progress
             "completed_bytes": self.completed_bytes,
             "down_total": self.down_total,
@@ -241,6 +253,7 @@ class ClientStats:
         else:
             self.ratio = 0.0
 
+
 class Statistics:
     """Enhanced statistics manager with proper speed calculation"""
 
@@ -254,15 +267,17 @@ class Statistics:
             info_hash=self.torrent.info_hash,
             name=self.torrent.name,
             size_bytes=self.torrent.total_size,
+            comment=self.torrent.comment,
+            creation_date=self.torrent.creation_date,
             left_bytes=max(
                 0, self.torrent.total_size - self.piece_manager.get_total_downloaded()
             ),
             size_chunks=len(self.torrent.piece_hashes),
             chunk_size=self.torrent.piece_length,
             download_path=download_path,
-            base_path=download_path,
+            base_path=str(Path(download_path).parent),
             base_filename=self.torrent.name,
-            directory=download_path,
+            directory=str(Path(download_path).parent),
         )
         for driver in self.client.discovery_mechanisms:
             if isinstance(driver, TrackerDriver):
@@ -287,19 +302,13 @@ class Statistics:
             down_total = connection.protocol.total_downloaded
             up_total = connection.protocol.total_uploaded
 
-            total_downloaded[
-                connection.protocol.peer
-            ] = down_total
-            total_uploaded[
-                connection.protocol.peer
-            ] = up_total
+            total_downloaded[connection.protocol.peer] = down_total
+            total_uploaded[connection.protocol.peer] = up_total
 
             ip, port = connection.protocol.peer
             if (ip, port) in peers_dict:
                 self.stats.peers[peers_dict[(ip, port)]].update_speeds(
-                    down_total,
-                    up_total,
-                    current_time
+                    down_total, up_total, current_time
                 )
             else:
                 new_peer = Peer(
@@ -323,10 +332,10 @@ class Statistics:
             )
             size_chunks = math.ceil(file_data["length"] / self.stats.chunk_size)
             new_file = File(
-                path=file_data["path"],
+                path=file_data["tail"],
                 size_bytes=file_data["length"],
                 size_chunks=size_chunks,
-                completed_chunks=completed_chunks
+                completed_chunks=completed_chunks,
             )
             if len(self.stats.files) <= file_idx:
                 self.stats.files.append(new_file)
@@ -334,7 +343,7 @@ class Statistics:
                 self.stats.files[file_idx].completed_chunks = completed_chunks
 
         self.update_downloaded(downloaded)
-        #self.update_uploaded(uploaded)
+        # self.update_uploaded(uploaded)
 
         # Update peer counts
         connected_peers = self.connection_manager.get_connection_count()
