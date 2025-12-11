@@ -113,9 +113,11 @@ class PeerWireProtocol:
             self.socket.connect(self.peer)
             self.socket.settimeout(self.connection_timeout)
             self.logger.info(f"Connected to peer {self.peer}")
-            self._handshake()
-            self.connected = True
-            return True
+            if self._handshake():
+                self.connected = True
+                return True
+            else:
+                return False
         except socket.timeout:
             self.logger.warning(f"Connection timeout to peer {self.peer}")
             return False

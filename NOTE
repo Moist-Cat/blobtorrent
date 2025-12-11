@@ -1,1 +1,3 @@
 delet peers from stats on disconnect--that is, when they are no longer in the connection manager
+
+maybe use temp files and move to avoid potential corruption during a crash when writing

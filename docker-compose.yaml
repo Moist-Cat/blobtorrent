@@ -10,6 +10,7 @@ services:
       - ./src:/app
     networks:
       - blobtorrent-net
+    hostname: tracker
     deploy:
       replicas: 3
       update_config:

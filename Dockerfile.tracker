@@ -11,4 +11,4 @@ RUN mkdir /out/ /log/
 EXPOSE 6969
 
 # Run tracker
-CMD ["python", "tracker.py"]
+CMD ["python", "tracker_server.py"]

@@ -16,23 +16,38 @@ import json
 from urllib.parse import unquote, unquote_to_bytes
 
 from filesystem import BencodeEncoder
+from tracker.manager import TrackerGossipManager
 
 # Configure logging
 logger = logging.getLogger("blobtorrent-tracker")
 
 
 class TrackerService:
-    def __init__(self, host: str = "0.0.0.0", port: int = 6969):
+    def __init__(self, host: str = "0.0.0.0", port: int = 6969, gossip_port: int = 6970, seed_hostnames=None):
         self.host = host
         self.port = port
-        self.peers: Dict[
-            bytes, Set[Tuple[str, int]]
-        ] = {}  # info_hash -> set of (ip, port)
-        self.last_announce: Dict[
-            Tuple[bytes, str, int], float
-        ] = {}  # (info_hash, ip, port) -> timestamp
+        self.peers: Dict[bytes, Set[Tuple[str, int]]] = (
+            {}
+        )  # info_hash -> set of (ip, port)
+        self.last_announce: Dict[Tuple[bytes, str, int], float] = (
+            {}
+        )  # (info_hash, ip, port) -> timestamp
         self.cleanup_interval = 300  # Clean up every 5 minutes
         self.peer_timeout = 1800  # Remove peers after 30 minutes of inactivity
+
+        local_ip = socket.gethostbyname(socket.gethostname())
+
+        # Initialize gossip manager
+        self.gossip_manager = TrackerGossipManager(
+            hostname=socket.gethostname(),
+            ip=local_ip,
+            port=gossip_port,
+            tracker_id=int(time.time() * 1000).to_bytes(20, "little"),
+            seed_hostnames=seed_hostnames or ["tracker"],
+            max_trackers=50
+        )
+
+        logger.info(f"Distributed tracker initialized on {host}:{port}, gossip on {gossip_port}")
 
     async def start(self):
         """Start the tracker service"""
@@ -52,6 +67,8 @@ class TrackerService:
         await site.start()
 
         logger.info(f"Tracker service started on {self.host}:{self.port}")
+
+        self.gossip_manager.start()
 
         # Keep the server running
         await asyncio.Future()
@@ -119,6 +136,7 @@ class TrackerService:
                 logger.info(
                     f"Added peer {client_ip}:{port} for info_hash {info_hash.hex()}"
                 )
+                self.gossip_manager.add_peer(info_hash, (client_ip, port))
             elif event == "stopped":
                 self.peers[info_hash].discard((client_ip, port))
                 logger.info(
@@ -132,10 +150,8 @@ class TrackerService:
             # Prepare response
             response_data = {
                 # b'interval': 1800,  # 30 minutes
-                b"interval": 30,  # 30 minutes
-                b"complete": len(
-                    [p for p in peers_list if p[1] == 100]
-                ),  # Fake seeder count
+                b"interval": 30,  # 30 secs
+                b"complete": 0,
                 b"incomplete": len(peers_list),  # Leecher count
                 b"peers": self._format_peers(peers_list, compact),
             }
@@ -213,11 +229,36 @@ class TrackerService:
                 logger.error(f"Error in cleanup task: {e}")
 
 
-async def main():
-    """Main function to start the tracker service"""
-    tracker = TrackerService()
-    await tracker.start()
+
+def main():
+    """Example usage of distributed tracker."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Distributed BitTorrent Tracker")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=6969, help="HTTP tracker port")
+    parser.add_argument("--gossip-port", type=int, default=6970, help="Gossip protocol port")
+    parser.add_argument("--seed", action="append", help="Seed hostnames for bootstrapping")
+    
+    args = parser.parse_args()
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Start distributed tracker
+    tracker = TrackerService(
+        host=args.host,
+        port=args.port,
+        gossip_port=args.gossip_port,
+        seed_hostnames=args.seed or []
+    )
+    
+    import asyncio
+    asyncio.run(tracker.start())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
