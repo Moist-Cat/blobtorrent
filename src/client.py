@@ -55,7 +55,7 @@ class BitTorrentClient:
 
         # Generate peer ID
         self.peer_id = self._generate_peer_id()
-        self.output_dir = output_dir
+        self.output_dir = Path(output_dir)
 
         # Initialize port management
         self.port_manager = PortManager()
@@ -334,6 +334,7 @@ class BitTorrentClient:
                 self.connection_manager.cleanup_finished()
 
                 # Sleep to prevent busy waiting
+                # Try exponential sleep to avoid wasting resources
                 time.sleep(1)
                 self.save_peers(
                     binascii.hexlify(self.torrent.info_hash).decode(),
@@ -605,4 +606,4 @@ class TorrentManager:
 
 if __name__ == "__main__":
     manager = TorrentManager()
-    print(manager.get_torrents())
+    input()

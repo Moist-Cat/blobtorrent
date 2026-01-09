@@ -80,8 +80,8 @@ class TrackerGossipConnection:
         self.is_running = False
         
         # Wait for threads to finish
-        if self.message_thread:
-            self.message_thread.join(timeout=2.0)
+        #if self.message_thread:
+        #    self.message_thread.join(timeout=2.0)
         if self.keepalive_thread:
             self.keepalive_thread.join(timeout=2.0)
 
@@ -102,7 +102,7 @@ class TrackerGossipConnection:
             return success
         except Exception as e:
             logger.error(f"Failed to send message {message_id} to {self.protocol.peer}: {e}")
-            self.close()
+            self.stop()
             return False
     
     def send_gossip_hello(self, tracker_info: TrackerInfo) -> bool:
@@ -172,10 +172,6 @@ class TrackerGossipConnection:
         """Send keepalive message."""
         return self.protocol.send_keep_alive()
     
-    def close(self):
-        """Close the connection."""
-        self.stop()
-    
     def _message_loop(self):
         """Main message handling loop."""
         while self.is_running and self.protocol.connected:
@@ -209,7 +205,7 @@ class TrackerGossipConnection:
                 break
         
         # Connection ended
-        self.close()
+        self.stop()
     
     def _keepalive_loop(self):
         """Send periodic keepalive messages."""

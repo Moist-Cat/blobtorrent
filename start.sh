@@ -1,4 +1,6 @@
 #!/bin/bash
+#
+# docker run --rm --name doko -v "$(pwd)/src:/app" -v "$(pwd)/adapter:/adapter" -v "$(pwd)/torrent:/torrent" -v "$(pwd)/out:/out" --publish 5000:5000 --network blobtorrent-net blobtorrent sh ../entrypoint.sh
 set -e
 
 echo "Initializing swarm..."

@@ -191,58 +191,6 @@ class TrackerGossipManager:
             except:
                 pass
 
-    def _create_connection(self, protocol: TrackerGossipProtocol):
-        """Create a new TrackerGossipConnection."""
-        try:
-            connection = TrackerGossipConnection(
-                protocol=protocol,
-                on_message_callback=self._handle_gossip_message,
-                on_closed_callback=self._handle_connection_closed,
-                peer_id=self.tracker_id
-            )
-            
-            with self.lock:
-                self.connections[protocol.remote_peer_id] = connection
-            
-            # Start the connection
-            connection.start()
-            
-            # Send initial HELLO
-            self.tracker_info.uptime = time.time() - self.stats["start_time"]
-            connection.send_gossip_hello(self.tracker_info)
-            
-            self.logger.info(f"Created connection to tracker {protocol.peer}")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to create connection: {e}")
-
-    def _connect_to_tracker(self, tracker_info: TrackerInfo) -> bool:
-        """Connect to another tracker."""
-        try:
-            self.logger.info(
-                f"Connecting to tracker {tracker_info.hostname}:{tracker_info.port}"
-            )
-
-            # Create gossip protocol instance
-            protocol = TrackerGossipProtocol(
-                peer=(tracker_info.ip, tracker_info.port),
-                info_hash=self.swarm_hash,
-                peer_id=self.tracker_id,
-            )
-
-            # Connect and perform handshake
-            if protocol.connect():
-                # Create and start connection handler
-                self._create_connection(protocol)
-                return True
-
-        except Exception as e:
-            self.logger.error(
-                f"Failed to connect to tracker {tracker_info.hostname}:{tracker_info.port}: {e}"
-            )
-
-        return False
-
     def _handle_connection_closed(self, peer_id: bytes):
         """Handle when a connection is closed."""
         with self.lock:
@@ -456,7 +404,7 @@ class TrackerGossipManager:
                 self._send_peer_lists(target)
 
                 # Occasionally send tracker list
-                if random.random() < 0.2:  # 20% chance
+                if random.random() < (1/len(connections))*0.9:  # Guarantees convergence
                     self._send_tracker_list(target)
 
                 self.logger.debug(f"Gossiped with tracker at {target.protocol.peer}")
@@ -542,6 +490,64 @@ class TrackerGossipManager:
         threading.Thread(
             target=self._resolve_and_connect_hostname, args=(hostname,), daemon=True
         ).start()
+
+    def _create_connection(self, protocol: TrackerGossipProtocol):
+        """Create a new TrackerGossipConnection."""
+        if protocol.remote_peer_id in self.connections:
+            self.logger.info(f"Dropped duplicate connection to tracker {protocol.peer}")
+            protocol.close()
+            return
+        try:
+            connection = TrackerGossipConnection(
+                protocol=protocol,
+                on_message_callback=self._handle_gossip_message,
+                on_closed_callback=self._handle_connection_closed,
+                peer_id=self.tracker_id
+            )
+            
+            with self.lock:
+                self.connections[protocol.remote_peer_id] = connection
+            
+            # Start the connection
+            connection.start()
+            
+            # Send initial HELLO
+            self.tracker_info.uptime = time.time() - self.stats["start_time"]
+            connection.send_gossip_hello(self.tracker_info)
+            
+            self.logger.info(f"Created connection to tracker {protocol.peer}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to create connection: {e}")
+
+
+
+    def _connect_to_tracker(self, tracker_info: TrackerInfo) -> bool:
+        """Connect to another tracker."""
+        try:
+            self.logger.info(
+                f"Connecting to tracker {tracker_info.hostname}:{tracker_info.port}"
+            )
+
+            # Create gossip protocol instance
+            protocol = TrackerGossipProtocol(
+                peer=(tracker_info.ip, tracker_info.port),
+                info_hash=self.swarm_hash,
+                peer_id=self.tracker_id,
+            )
+
+            # Connect and perform handshake
+            if protocol.connect():
+                # Create and start connection handler
+                self._create_connection(protocol)
+                return True
+
+        except Exception as e:
+            self.logger.error(
+                f"Failed to connect to tracker {tracker_info.hostname}:{tracker_info.port}: {e}"
+            )
+
+        return False
 
     def _resolve_and_connect_hostname(self, hostname: str):
         """Resolve hostname and attempt to connect."""
